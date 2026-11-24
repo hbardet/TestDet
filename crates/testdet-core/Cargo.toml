@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+jsonschema = "0.63.1"
 saphyr = "0.4.0"
 saphyr-parser = "0.4.0"
 schemars = "1.2.3"

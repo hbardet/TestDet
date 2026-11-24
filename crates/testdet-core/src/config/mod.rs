@@ -6,5 +6,6 @@
 pub mod document;
 pub mod model;
 pub mod schema;
+pub mod validate;
 
 pub use document::Document;
