@@ -8,7 +8,7 @@
 use schemars::Schema;
 use schemars::generate::SchemaSettings;
 
-use crate::config::model::{Manifest, UsersFile};
+use crate::config::model::{Manifest, SecretsDeclaration, UsersFile};
 use crate::operation::model::Operation;
 
 /// The JSON Schema for a manifest file (`testdet.yaml`).
@@ -33,4 +33,12 @@ pub fn users() -> Schema {
     SchemaSettings::draft07()
         .into_generator()
         .into_root_schema_for::<UsersFile>()
+}
+
+/// The JSON Schema for a secrets declaration file (`testdet/secrets/<env>.yaml`).
+#[must_use]
+pub fn secrets() -> Schema {
+    SchemaSettings::draft07()
+        .into_generator()
+        .into_root_schema_for::<SecretsDeclaration>()
 }

@@ -65,10 +65,12 @@ pub struct Manifest {
     pub name: Option<String>,
     /// `defaultEnvironment`
     pub default_environment: Option<String>,
-    /// `collections`
-    #[serde(default)]
+    /// `collections`, the scanned collection list (§7.4/§7.19). Required:
+    /// a manifest omitting it is `E_MISSING_FIELD`.
     pub collections: Vec<String>,
-    /// `graphqlPath`, the default path for `kind: graphql` requests.
+    /// `graphqlPath`, the default path for `kind: graphql` requests (§7.5).
+    /// Defaults to `/graphql`, so a manifest may omit it.
+    #[serde(default = "default_graphql_path")]
     pub graphql_path: String,
     /// `baseUrl`, shorthand for a single generated `local` environment (§7.5).
     pub base_url: Option<String>,
@@ -78,6 +80,12 @@ pub struct Manifest {
     /// `environments` (optional per §7.5).
     #[serde(default)]
     pub environments: BTreeMap<String, Environment>,
+}
+
+/// The default `graphqlPath` for `kind: graphql` requests (§7.5).
+#[must_use]
+pub fn default_graphql_path() -> String {
+    "/graphql".into()
 }
 
 /// Manifest-level defaults.
@@ -99,8 +107,8 @@ pub struct Environment {
     pub graphql_path: Option<String>,
     /// `headers`
     pub headers: HeaderMap,
-    /// `vars`
-    pub vars: BTreeMap<String, String>,
+    /// `vars`, templating variables carrying typed JSON values (§7.8).
+    pub vars: BTreeMap<String, serde_json::Value>,
     /// `users` (override by name; never introduces a new user).
     pub users: BTreeMap<String, User>,
     /// `secrets`
@@ -124,8 +132,8 @@ pub struct User {
     pub token_header: Option<String>,
     /// `login`, an override of the users-file `defaultLogin`.
     pub login: Option<String>,
-    /// `vars`, per-user templating variables.
-    pub vars: BTreeMap<String, String>,
+    /// `vars`, per-user templating variables carrying typed JSON values (§7.8).
+    pub vars: BTreeMap<String, serde_json::Value>,
     /// `headers`
     pub headers: HeaderMap,
 }

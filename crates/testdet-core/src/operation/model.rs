@@ -20,9 +20,9 @@ pub struct Operation {
     pub tags: Vec<String>,
     /// `request`
     pub request: Request,
-    /// `vars`, flat templating variables (string → string).
+    /// `vars`, flat templating variables carrying typed JSON values (§7.8).
     #[serde(default)]
-    pub vars: BTreeMap<String, String>,
+    pub vars: BTreeMap<String, serde_json::Value>,
     /// `files`, referenced from variables as `{{file.<name>}}` (§7.14).
     #[serde(default)]
     pub files: BTreeMap<String, FileSpec>,

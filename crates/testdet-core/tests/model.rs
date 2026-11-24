@@ -1,7 +1,28 @@
 //! Tests for the config model types and their derived JSON Schemas.
 
-use testdet_core::config::model::HeaderMap;
+use testdet_core::config::model::{HeaderMap, Manifest};
 use testdet_core::config::schema;
+
+#[test]
+fn collections_is_required_and_graphql_path_defaults() {
+    // A manifest omitting `collections` is invalid (`E_MISSING_FIELD`).
+    let err = serde_json::from_str::<Manifest>(r#"{"version": 1}"#).unwrap_err();
+    assert!(err.to_string().contains("collections"));
+
+    // With `collections` present the manifest parses, and `graphqlPath`
+    // defaults to `/graphql`.
+    let manifest: Manifest =
+        serde_json::from_str(r#"{"version": 1, "collections": ["operations"]}"#).unwrap();
+    assert_eq!(manifest.collections, vec!["operations".to_string()]);
+    assert_eq!(manifest.graphql_path, "/graphql");
+}
+
+#[test]
+fn version_other_than_one_is_rejected() {
+    let err = serde_json::from_str::<Manifest>(r#"{"version": 2, "collections": ["operations"]}"#)
+        .unwrap_err();
+    assert!(err.to_string().contains("version must be 1"));
+}
 
 #[test]
 fn schema_forbids_unknown_fields_everywhere() {
