@@ -96,6 +96,19 @@ pub fn load_diagnostics(opts: &LoadOptions) -> Diagnostics {
     diagnostics
 }
 
+/// Re-run discovery and the collection scan, returning the best-effort config
+/// alongside every diagnostic (warnings included). Task 13's `validate` and
+/// `env` commands use this so they can work over a config that also carries
+/// crosscheck errors (e.g. an undeclared `{{env.X}}` reference).
+pub fn load_with_diagnostics(opts: &LoadOptions) -> (Option<Config>, Diagnostics) {
+    let (config, mut diagnostics) = build(opts);
+    if let Some(config) = &config {
+        diagnostics.extend(crosscheck(config).iter().cloned());
+    }
+    sort(&mut diagnostics);
+    (config, diagnostics)
+}
+
 /// The single pass: discover, load the manifest, scan collections, load the
 /// users file and the secrets declaration, accumulating every diagnostic.
 /// Returns the best-effort config (built once the manifest parses) and the

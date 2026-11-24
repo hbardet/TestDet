@@ -283,7 +283,7 @@ fn check_unused_files(
 /// Build the synthetic document that is the per-operation scan surface, so
 /// every reference carries a document path (`query`, `variables.email`,
 /// `body.value.x`, `headers.Authorization`, `vars.userId`, `capture.token`).
-fn scan_surface(operation: &Operation) -> Value {
+pub(crate) fn scan_surface(operation: &Operation) -> Value {
     let mut doc = serde_json::Map::new();
 
     match &operation.request {

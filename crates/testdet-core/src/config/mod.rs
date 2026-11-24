@@ -14,6 +14,8 @@ pub mod schema;
 pub mod validate;
 
 pub use crosscheck::{check_value, crosscheck};
-pub use discover::{Config, LoadOptions, discover, load_config, load_diagnostics};
+pub use discover::{
+    Config, LoadOptions, discover, load_config, load_diagnostics, load_with_diagnostics,
+};
 pub use document::Document;
 pub use resolve::{Resolved, SecretsConfig, resolve};

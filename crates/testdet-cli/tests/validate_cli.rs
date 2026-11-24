@@ -102,6 +102,35 @@ fn warnings_alone_exit_zero() {
 }
 
 #[test]
+fn unset_declared_secret_is_a_warning_that_exits_zero() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        "version: 1\nname: my-api\ncollections: [ops]\ndefaultEnvironment: staging\nenvironments:\n  staging:\n    baseUrl: https://staging.example.com\n",
+    );
+    write(
+        root.path(),
+        "testdet/secrets/staging.yaml",
+        "TESTDET_VALIDATE_UNSET:\n  description: declared but unset\n",
+    );
+    write(
+        root.path(),
+        "testdet/ops/login.yaml",
+        "id: login\nrequest:\n  kind: http\n  method: GET\n  path: /login/{{env.TESTDET_VALIDATE_UNSET}}\n",
+    );
+    let config = root.path().join("testdet/testdet.yaml");
+
+    let (exit, output) = validate(Some(config), Format::Text);
+    assert_eq!(exit, Exit::Ok, "unset-secret warnings must exit 0");
+    assert!(output.contains("W_UNSET_SECRET"), "warning is rendered");
+    assert!(
+        output.contains("TESTDET_VALIDATE_UNSET"),
+        "the warning names the secret"
+    );
+}
+
+#[test]
 fn ndjson_is_a_usage_error_for_validate() {
     let (_root, config) = build_config(clean_operation(), "upload.yaml");
     let (exit, output) = validate(Some(config), Format::Ndjson);

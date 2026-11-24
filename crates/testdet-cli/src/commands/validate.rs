@@ -3,8 +3,9 @@
 use std::path::PathBuf;
 
 use testdet_core::config::LoadOptions;
-use testdet_core::config::load_diagnostics;
+use testdet_core::config::load_with_diagnostics;
 use testdet_core::diagnostic::{render_json, render_text};
+use testdet_core::secrets::secret_warnings;
 
 use crate::exit::Exit;
 use crate::format::Format;
@@ -46,10 +47,17 @@ pub fn run(args: ValidateArgs) -> (Exit, String) {
         }
     };
 
-    let diagnostics = load_diagnostics(&LoadOptions {
+    let (config, mut diagnostics) = load_with_diagnostics(&LoadOptions {
         config: args.config,
         cwd,
     });
+
+    // Surface unset-secret warnings (ruling 6): a declared-but-unset reference
+    // is a warning; an undeclared reference is already `E_UNKNOWN_ENV` from
+    // crosscheck and is not duplicated here.
+    if let Some(config) = &config {
+        diagnostics.extend(secret_warnings(config).iter().cloned());
+    }
 
     let exit = if diagnostics.has_errors() {
         Exit::ConfigInvalid

@@ -5,6 +5,7 @@
 //! every write to `testdet-cli::run` so tests never have to spawn a process to
 //! assert on content or exit codes.
 
+pub mod env;
 pub mod show;
 pub mod validate;
 

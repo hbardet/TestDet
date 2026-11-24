@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{show, validate};
+use crate::commands::{env, show, validate};
 use crate::exit::Exit;
 use crate::format::Format;
 
@@ -34,7 +34,7 @@ enum Commands {
     /// Run a single operation end to end.
     Run,
     /// Inspect environment variables.
-    Env,
+    Env(EnvCli),
     /// Show the resolved configuration.
     Config,
     /// Emit the JSON Schema for the config.
@@ -54,6 +54,19 @@ struct ValidateCli {
     /// Environment override (accepted and ignored in v1).
     #[arg(long)]
     env: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct EnvCli {
+    /// Explicit config path; otherwise discovered by walking up from the cwd.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Environment to resolve; defaults to the manifest `defaultEnvironment`.
+    #[arg(long)]
+    env: Option<String>,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    format: Format,
 }
 
 #[derive(clap::Args)]
@@ -96,6 +109,16 @@ pub fn run(argv: Vec<OsString>) -> u8 {
             // when the exit code is 1.
             emit(exit, &output, format == Format::Json)
         }
+        Commands::Env(args) => {
+            let (exit, output) = env::run(env::EnvArgs {
+                config: args.config,
+                env: args.env,
+                format: args.format,
+            });
+            // The body (text or json) belongs on stdout; diagnostics and usage
+            // errors go to stderr (ruling 7).
+            emit(exit, &output, exit == Exit::Ok)
+        }
         Commands::Show(args) => {
             let format = args.format;
             let (exit, output) = show::run(show::ShowArgs {
@@ -107,7 +130,7 @@ pub fn run(argv: Vec<OsString>) -> u8 {
             // stdout; diagnostics and usage errors are text and go to stderr.
             emit(exit, &output, format == Format::Json && exit == Exit::Ok)
         }
-        Commands::Tui | Commands::Run | Commands::Env | Commands::Config | Commands::Schema => {
+        Commands::Tui | Commands::Run | Commands::Config | Commands::Schema => {
             eprintln!("not implemented");
             4
         }
