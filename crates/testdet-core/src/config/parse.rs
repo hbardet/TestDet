@@ -39,7 +39,7 @@ pub fn parse_users(doc: &Document) -> Result<UsersFile, Diagnostics> {
 }
 
 /// The shared conversion pipeline for all three file kinds.
-fn deserialize_validated<T>(
+pub(crate) fn deserialize_validated<T>(
     doc: &Document,
     schema: &Schema,
     kind: SchemaKind,
