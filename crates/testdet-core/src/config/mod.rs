@@ -4,5 +4,7 @@
 //! conversion, schema validation and resolution performed by later tasks.
 
 pub mod document;
+pub mod model;
+pub mod schema;
 
 pub use document::Document;
