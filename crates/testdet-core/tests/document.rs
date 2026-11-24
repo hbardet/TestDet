@@ -75,3 +75,58 @@ fn rejects_a_non_map_top_level_with_a_span() {
         );
     }
 }
+
+#[test]
+fn anchors_are_rejected() {
+    let diagnostics = Document::load(&fixture("anchors.yaml")).expect_err("anchor");
+    let diagnostic = diagnostics.iter().next().expect("one diagnostic");
+    assert_eq!(diagnostic.code, codes::E_UNKNOWN_FIELD);
+    assert!(
+        diagnostic.message.contains("anchor"),
+        "message should name the anchor: {:?}",
+        diagnostic.message
+    );
+    assert_eq!(diagnostic.span.expect("a span").line, 1);
+}
+
+#[test]
+fn aliases_are_rejected() {
+    let diagnostics = Document::load(&fixture("aliases.yaml")).expect_err("alias");
+    let alias = diagnostics
+        .iter()
+        .find(|d| d.message.contains("alias"))
+        .expect("the `*b` alias is reported");
+    assert_eq!(alias.code, codes::E_UNKNOWN_FIELD);
+    assert_eq!(alias.span.expect("a span").line, 2);
+}
+
+#[test]
+fn merge_keys_are_rejected_by_name() {
+    let diagnostics = Document::load(&fixture("merge-key.yaml")).expect_err("merge key");
+    // The pre-scan rejects the `*base` alias before the tree walk ever sees
+    // the `<<` merge key, so the message names the alias rather than the
+    // merge key. The merge key itself is still rejected by the tree walk's
+    // unknown-field path when no alias is present.
+    let alias = diagnostics
+        .iter()
+        .find(|d| d.message.contains("alias"))
+        .expect("the `*base` alias is reported before the merge key");
+    assert_eq!(alias.code, codes::E_UNKNOWN_FIELD);
+    assert_eq!(alias.span.expect("a span").line, 2);
+}
+
+#[test]
+fn valid_document_without_anchors_still_loads_with_spans() {
+    let document = Document::load(&fixture("headers.yaml")).expect("valid document");
+    assert_eq!(
+        document.span_at("version"),
+        Some(Span { line: 1, column: 1 })
+    );
+    assert_eq!(
+        document.span_at("headers.Authorization"),
+        Some(Span {
+            line: 4,
+            column: 13,
+        })
+    );
+}

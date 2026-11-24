@@ -27,8 +27,8 @@ impl Document {
     /// Load and project the YAML file at `path`.
     ///
     /// The top level must be a mapping. Parse failures, duplicate keys, a
-    /// non-mapping top level and YAML merge keys are all reported as
-    /// [`Diagnostics`] errors.
+    /// non-mapping top level, YAML anchors/aliases and YAML merge keys are all
+    /// reported as [`Diagnostics`] errors.
     pub fn load(path: &Path) -> Result<Document, Diagnostics> {
         let source = std::fs::read_to_string(path).map_err(|error| {
             Diagnostics::from(vec![Diagnostic {
@@ -41,6 +41,14 @@ impl Document {
                 hint: None,
             }])
         })?;
+
+        // `saphyr` expands anchors and aliases before projecting the tree, so
+        // they are invisible to the walk below. Reject them from the event
+        // stream before building anything.
+        let pre_scan = scan_anchors_and_aliases(&source, path);
+        if pre_scan.has_errors() {
+            return Err(pre_scan);
+        }
 
         let docs = MarkedYaml::load_from_str(&source).map_err(|error| {
             let span = span_of(error.marker());
@@ -142,6 +150,59 @@ fn non_mapping_error(path: &Path, span: Span, message: &str) -> Diagnostics {
         message: message.to_string(),
         hint: None,
     }])
+}
+
+/// Reject YAML anchors and aliases by walking the parser event stream once.
+///
+/// `saphyr` transparently resolves both when it projects the tree, so neither
+/// is ever visible to the tree walk. The events are the only place they
+/// surface: an anchor appears as a non-zero `anchor_id` on a scalar or
+/// collection start, and an alias as [`Event::Alias`]. Merge keys are left to
+/// the tree walk, which already rejects a literal `<<` key as an unknown
+/// field. Every offending construct is reported, not just the first.
+fn scan_anchors_and_aliases(source: &str, path: &Path) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    let mut parser = saphyr_parser::Parser::new_from_str(source);
+    while let Some(result) = parser.next_event() {
+        let Ok((event, span)) = result else {
+            // A scan error is reported by the tree walk's own loader; stop the
+            // pre-scan here rather than duplicate it.
+            break;
+        };
+        let span = span_of(&span.start);
+        match event {
+            saphyr_parser::Event::Alias(_) => diags.push(unsupported_construct(
+                path,
+                span,
+                "YAML aliases (`*name`) are not supported",
+            )),
+            saphyr_parser::Event::Scalar(_, _, anchor_id, _)
+            | saphyr_parser::Event::SequenceStart(anchor_id, _)
+            | saphyr_parser::Event::MappingStart(anchor_id, _)
+                if anchor_id != 0 =>
+            {
+                diags.push(unsupported_construct(
+                    path,
+                    span,
+                    "YAML anchors (`&name`) are not supported",
+                ));
+            }
+            _ => {}
+        }
+    }
+    diags
+}
+
+fn unsupported_construct(path: &Path, span: Span, message: &str) -> Diagnostic {
+    Diagnostic {
+        code: codes::E_UNKNOWN_FIELD,
+        severity: Severity::Error,
+        file: Some(path.to_path_buf()),
+        span: Some(span),
+        path: None,
+        message: message.to_string(),
+        hint: None,
+    }
 }
 
 /// Project a saphyr node into JSON while recording spans for every child path.

@@ -355,6 +355,7 @@ name = "testdet-core"
 version = "0.1.0"
 dependencies = [
  "saphyr",
+ "saphyr-parser",
  "serde",
  "serde_json",
 ]

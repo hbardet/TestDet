@@ -1,0 +1,2 @@
+base: &base {x: 1}
+<<: *base
