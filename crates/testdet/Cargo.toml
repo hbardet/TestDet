@@ -1,0 +1,9 @@
+[package]
+name = "testdet"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+testdet-cli = { path = "../testdet-cli" }
+testdet-core = { path = "../testdet-core" }
+testdet-tui = { path = "../testdet-tui" }
