@@ -5,10 +5,13 @@
 
 pub mod discover;
 pub mod document;
+pub mod merge;
 pub mod model;
 pub mod parse;
+pub mod resolve;
 pub mod schema;
 pub mod validate;
 
 pub use discover::{Config, LoadOptions, discover, load_config, load_diagnostics};
 pub use document::Document;
+pub use resolve::{Resolved, SecretsConfig, resolve};

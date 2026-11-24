@@ -45,6 +45,16 @@ pub enum Request {
     Http(HttpRequest),
 }
 
+impl Request {
+    /// The request's header map, whichever variant this is.
+    pub fn headers(&self) -> &HeaderMap {
+        match self {
+            Request::Graphql(request) => &request.headers,
+            Request::Http(request) => &request.headers,
+        }
+    }
+}
+
 /// A GraphQL request.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]

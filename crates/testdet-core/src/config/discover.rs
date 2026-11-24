@@ -45,6 +45,8 @@ pub struct Config {
     pub operations: BTreeMap<String, Operation>,
     pub users: BTreeMap<String, User>,
     pub secrets: SecretsDeclaration,
+    /// `defaultLogin` from the users file; `None` when the file is absent.
+    pub default_login: Option<String>,
 }
 
 /// Locate the manifest file, returning its path.
@@ -119,6 +121,7 @@ fn build(opts: &LoadOptions) -> (Option<Config>, Diagnostics) {
     let mut operations = BTreeMap::new();
     let mut users = BTreeMap::new();
     let mut secrets = SecretsDeclaration::default();
+    let mut default_login = None;
 
     // Collections: order preserved, duplicates allowed and harmless.
     for collection in &manifest.collections {
@@ -145,7 +148,10 @@ fn build(opts: &LoadOptions) -> (Option<Config>, Diagnostics) {
     let users_path = root_dir.join("users.yaml");
     if users_path.is_file() {
         match Document::load(&users_path).and_then(|doc| parse_users(&doc)) {
-            Ok(users_file) => users = users_file.users,
+            Ok(users_file) => {
+                users = users_file.users;
+                default_login = users_file.default_login;
+            }
             Err(err) => diagnostics.extend(err.iter().cloned()),
         }
     }
@@ -176,6 +182,7 @@ fn build(opts: &LoadOptions) -> (Option<Config>, Diagnostics) {
         operations,
         users,
         secrets,
+        default_login,
     };
     (Some(config), diagnostics)
 }
