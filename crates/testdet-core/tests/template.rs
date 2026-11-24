@@ -66,6 +66,20 @@ fn a_whole_value_expression_preserves_the_type() {
 }
 
 #[test]
+fn a_whole_value_big_integer_survives_substitution() {
+    let huge: Value = serde_json::from_str("99999999999999999999").expect("arbitrary precision");
+    let vars = BTreeMap::from([("huge".to_string(), huge)]);
+    let session = BTreeMap::new();
+    let files = BTreeMap::new();
+    let env = empty_secrets();
+    let resolver = resolver(&vars, &session, &env, &files);
+
+    let resolved = resolver.resolve_str("{{var.huge}}").unwrap();
+    assert!(resolved.is_number(), "expected a number, got {resolved:?}");
+    assert_eq!(resolved.to_string(), "99999999999999999999");
+}
+
+#[test]
 fn an_object_and_a_bool_survive_a_whole_value_expression() {
     let vars = BTreeMap::from([
         ("profile".to_string(), json!({"name": "Ada", "admin": true})),

@@ -23,7 +23,7 @@ use crate::operation::model::Operation;
 pub struct SecretsConfig {
     pub source: SecretSource,
     pub file: Option<PathBuf>,
-    pub declaration: SecretsDeclaration,
+    pub declaration: Option<SecretsDeclaration>,
 }
 
 /// The fully resolved configuration for one environment.
@@ -46,8 +46,6 @@ pub struct Resolved {
     env_vars: BTreeMap<String, Value>,
     /// `--var` values parsed as strings, the top variable layer.
     cli_vars: BTreeMap<String, Value>,
-    /// `config.default_login`, the user selected when none is passed.
-    default_user: Option<String>,
 }
 
 /// Resolve `config` for one environment, applying every §7.19 layer.
@@ -101,15 +99,8 @@ pub fn resolve(
         }
     }
 
-    let default_user = config.default_login.clone();
-
     let env_vars = environment.vars.clone();
     let mut vars = env_vars.clone();
-    if let Some(name) = &default_user
-        && let Some(user) = users.get(name)
-    {
-        merge_vars(&mut vars, &user.vars);
-    }
 
     let mut cli = BTreeMap::new();
     for (name, value) in cli_vars {
@@ -117,12 +108,7 @@ pub fn resolve(
     }
     merge_vars(&mut vars, &cli);
 
-    let mut headers = base_headers.clone();
-    if let Some(name) = &default_user
-        && let Some(user) = users.get(name)
-    {
-        merge_headers(&mut headers, &user.headers);
-    }
+    let headers = base_headers.clone();
 
     let secrets = SecretsConfig {
         source: environment
@@ -168,7 +154,6 @@ pub fn resolve(
         base_headers,
         env_vars,
         cli_vars: cli,
-        default_user,
     })
 }
 
@@ -200,7 +185,7 @@ impl Resolved {
     /// highest: manifest defaults, environment, user, operation request.
     pub fn headers_for(&self, operation: &Operation, user: Option<&str>) -> HeaderMap {
         let mut headers = self.base_headers.clone();
-        if let Some(name) = user.or(self.default_user.as_deref())
+        if let Some(name) = user
             && let Some(selected) = self.users.get(name)
         {
             merge_headers(&mut headers, &selected.headers);
@@ -214,7 +199,7 @@ impl Resolved {
     pub fn vars_for(&self, operation: &Operation, user: Option<&str>) -> BTreeMap<String, Value> {
         let mut vars = operation.vars.clone();
         merge_vars(&mut vars, &self.env_vars);
-        if let Some(name) = user.or(self.default_user.as_deref())
+        if let Some(name) = user
             && let Some(selected) = self.users.get(name)
         {
             merge_vars(&mut vars, &selected.vars);
@@ -237,6 +222,17 @@ fn select_environment(
     if let Some(name) = env {
         if let Some(environment) = config.manifest.environments.get(name) {
             return Some((name.to_string(), environment.clone()));
+        }
+        // `--env local` is accepted on a shorthand config (no declared
+        // environments), mirroring the synthetic fallback below.
+        if name == "local" && config.manifest.environments.is_empty() {
+            return Some((
+                name.to_string(),
+                Environment {
+                    base_url: None,
+                    ..Environment::default()
+                },
+            ));
         }
         let declared = declared_names(&config.manifest.environments);
         diagnostics.push(Diagnostic {

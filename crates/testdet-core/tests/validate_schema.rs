@@ -108,3 +108,65 @@ fn validate_manifest_str(source: &str) -> testdet_core::diagnostic::Diagnostics 
     let _ = std::fs::remove_file(&path);
     diags
 }
+
+/// Validate an inline operation YAML string against the operation schema.
+fn validate_operation_str(source: &str) -> testdet_core::diagnostic::Diagnostics {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("testdet-op-{unique}.yaml"));
+    std::fs::write(&path, source).expect("failed to write temporary fixture");
+    let document = Document::load(&path).expect("valid document");
+    let diags = validate_document(&document, &schema::operation(), SchemaKind::Operation);
+    let _ = std::fs::remove_file(&path);
+    diags
+}
+
+#[test]
+fn a_missing_http_path_is_reported_at_request_path_not_the_collapse() {
+    let source = "id: op\nrequest:\n  kind: http\n  method: GET\n";
+    let diags = validate_operation_str(source);
+    assert!(
+        diags.iter().any(|d| {
+            d.code == codes::E_MISSING_FIELD && d.path.as_deref() == Some("request.path")
+        }),
+        "missing `path` is reported at its own path, got: {diags:?}"
+    );
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.code == codes::E_WRONG_TYPE && d.path.as_deref() == Some("request")),
+        "the oneOf collapse must expand into the branch error"
+    );
+}
+
+#[test]
+fn a_wrong_typed_http_method_is_reported_at_request_method() {
+    let source = "id: op\nrequest:\n  kind: http\n  method: 5\n  path: /x\n";
+    let diags = validate_operation_str(source);
+    assert!(
+        diags.iter().any(|d| {
+            d.code == codes::E_WRONG_TYPE && d.path.as_deref() == Some("request.method")
+        }),
+        "wrong-typed `method` is reported at its own path, got: {diags:?}"
+    );
+}
+
+#[test]
+fn an_unknown_http_key_gets_a_did_you_mean_hint() {
+    let source = "id: op\nrequest:\n  kind: http\n  methd: GET\n  path: /x\n";
+    let diags = validate_operation_str(source);
+    let unknown = diags
+        .iter()
+        .find(|d| d.code == codes::E_UNKNOWN_FIELD && d.path.as_deref() == Some("request.methd"))
+        .expect("the misspelled key is reported");
+    assert!(
+        unknown
+            .hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("method")),
+        "hint suggests `method`, got: {unknown:?}"
+    );
+}

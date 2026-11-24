@@ -51,7 +51,8 @@ struct ValidateCli {
     /// Output format.
     #[arg(long, value_enum, default_value = "text")]
     format: Format,
-    /// Environment override (accepted and ignored in v1).
+    /// Environment override; selects the secrets declaration file
+    /// (`testdet/secrets/<env>.yaml`).
     #[arg(long)]
     env: Option<String>,
 }

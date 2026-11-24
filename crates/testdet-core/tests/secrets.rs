@@ -52,7 +52,7 @@ fn config_with(
     manifest: Manifest,
     root_dir: PathBuf,
     operations: BTreeMap<String, Operation>,
-    secrets: SecretsDeclaration,
+    secrets: Option<SecretsDeclaration>,
 ) -> Config {
     Config {
         manifest,
@@ -60,8 +60,10 @@ fn config_with(
         operations,
         users: BTreeMap::new(),
         secrets,
+        secrets_env: "local".to_string(),
         default_login: None,
         operation_files: BTreeMap::new(),
+        documents: BTreeMap::new(),
     }
 }
 
@@ -97,7 +99,7 @@ fn shell_env_beats_dotenv_which_beats_the_declared_default() {
     let dotenv_cfg = SecretsConfig {
         source: SourceKind::Dotenv,
         file: Some(root.path().join(".env.staging")),
-        declaration: declaration.clone(),
+        declaration: Some(declaration.clone()),
     };
     let source = build_source(&dotenv_cfg, root.path());
 
@@ -120,7 +122,7 @@ fn shell_env_beats_dotenv_which_beats_the_declared_default() {
     let env_cfg = SecretsConfig {
         source: SourceKind::Env,
         file: None,
-        declaration,
+        declaration: Some(declaration),
     };
     let env_source = build_source(&env_cfg, root.path());
     let lookup = env_source.lookup(name);
@@ -152,7 +154,7 @@ fn an_undeclared_reference_is_an_error_and_an_unset_declared_name_is_a_warning()
             "op".to_string(),
             http_op("op", "/x/{{env.DECLARED}}/{{env.MISSING}}"),
         )]),
-        secrets,
+        Some(secrets),
     );
 
     // The undeclared reference is an error, from crosscheck (not duplicated).
@@ -192,7 +194,7 @@ fn a_config_with_no_declaration_file_treats_every_reference_as_required() {
             ("opA".to_string(), http_op("opA", "/a/{{env.A}}")),
             ("opB".to_string(), http_op("opB", "/b/{{env.B}}")),
         ]),
-        SecretsDeclaration::default(),
+        None,
     );
 
     let requirements = required_vars(&config);
@@ -236,7 +238,7 @@ fn required_vars_reports_the_origin_never_the_value() {
             "login".to_string(),
             http_op("login", "/login/{{env.API_TOKEN}}"),
         )]),
-        secrets,
+        Some(secrets),
     );
 
     let requirements = required_vars(&config);

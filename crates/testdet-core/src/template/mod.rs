@@ -9,4 +9,4 @@ pub mod resolve;
 pub mod value;
 
 pub use resolve::Resolver;
-pub use value::{Reference, Token, parse_token, references};
+pub use value::{Malformed, Reference, Token, malformed, parse_token, references};

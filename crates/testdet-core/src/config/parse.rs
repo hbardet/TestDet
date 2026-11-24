@@ -103,14 +103,17 @@ fn reclassify(doc: &Document, kind: SchemaKind, diagnostics: Diagnostics) -> Dia
     }
 
     let rules = operation_rules(doc);
-    if rules.is_empty() {
-        return diagnostics;
-    }
+    let kind_known = doc
+        .root()
+        .get("request")
+        .and_then(|request| request.get("kind"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "graphql" || kind == "http");
 
     let specific: BTreeSet<String> = rules.iter().map(|rule| rule.path.clone()).collect();
     let mut kept: Vec<Diagnostic> = diagnostics
         .iter()
-        .filter(|diagnostic| !reclassified(diagnostic, &specific))
+        .filter(|diagnostic| !reclassified(diagnostic, &specific, kind_known))
         .cloned()
         .collect();
     kept.extend(rules.into_iter().map(|rule| rule.diagnostic));
@@ -119,12 +122,13 @@ fn reclassify(doc: &Document, kind: SchemaKind, diagnostics: Diagnostics) -> Dia
 }
 
 /// Whether a schema diagnostic is superseded by a specific per-file rule.
-fn reclassified(diagnostic: &Diagnostic, specific: &BTreeSet<String>) -> bool {
-    // The schema collapses every tagged-union failure (`Request`/`Body`) into a
-    // single `oneOf` `E_WRONG_TYPE` at `request`. Once a specific rule names the
-    // real problem, that collapse is a duplicate.
+fn reclassified(diagnostic: &Diagnostic, specific: &BTreeSet<String>, kind_known: bool) -> bool {
+    // The schema collapses a tagged-union failure into an `E_WRONG_TYPE` at
+    // `request` only when the `kind` discriminator is missing or unknown. That
+    // collapse must survive (the missing discriminator is the problem); drop it
+    // only when the discriminator is known and a rule names the real problem.
     if diagnostic.code == codes::E_WRONG_TYPE && diagnostic.path.as_deref() == Some("request") {
-        return true;
+        return kind_known && !specific.is_empty();
     }
     // Defensive: should the schema ever surface the granular error at the exact
     // path a rule now owns, drop it there too.

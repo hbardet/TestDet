@@ -31,6 +31,7 @@ fn from_cwd(dir: &Path) -> LoadOptions {
     LoadOptions {
         config: None,
         cwd: dir.to_path_buf(),
+        env: None,
     }
 }
 
@@ -61,6 +62,7 @@ fn config_flag_accepts_a_directory_or_a_manifest_path() {
         let opts = LoadOptions {
             config,
             cwd: root.path().to_path_buf(),
+            env: None,
         };
         let found = discover(&opts).unwrap();
         assert_eq!(std::fs::canonicalize(&found).unwrap(), expected);
@@ -145,6 +147,57 @@ fn scans_collections_recursively_and_rejects_duplicate_ids() {
     );
     assert!(
         duplicate.message.contains("operations/users/getUser.yaml"),
+        "message names the second file, got: {:?}",
+        duplicate.message
+    );
+}
+
+#[test]
+fn duplicate_ids_across_collections_are_rejected() {
+    let root = TempDir::new().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        &manifest_yaml("[one, two]"),
+    );
+    write(
+        root.path(),
+        "testdet/one/getUser.yaml",
+        &operation_yaml("getUser"),
+    );
+    write(
+        root.path(),
+        "testdet/two/getUser.yaml",
+        &operation_yaml("getUser"),
+    );
+
+    let diagnostics = load_config(&from_cwd(root.path())).unwrap_err();
+
+    let duplicates: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.code == codes::E_DUPLICATE_ID)
+        .collect();
+    assert_eq!(
+        duplicates.len(),
+        1,
+        "the same id in two collections is one duplicate"
+    );
+
+    let duplicate = duplicates[0];
+    assert_eq!(duplicate.path.as_deref(), Some("id"));
+
+    // Scan order: one < two, so the second file is two/getUser.yaml.
+    let root_dir = std::fs::canonicalize(root.path().join("testdet")).unwrap();
+    let second = root_dir.join("two/getUser.yaml");
+    assert_eq!(duplicate.file.as_deref(), Some(second.as_path()));
+
+    assert!(
+        duplicate.message.contains("one/getUser.yaml"),
+        "message names the first file, got: {:?}",
+        duplicate.message
+    );
+    assert!(
+        duplicate.message.contains("two/getUser.yaml"),
         "message names the second file, got: {:?}",
         duplicate.message
     );
@@ -239,6 +292,7 @@ fn relative_paths_resolve_against_the_config_directory_not_the_cwd() {
     let opts = LoadOptions {
         config: Some(root.path().join("testdet/testdet.yaml")),
         cwd: elsewhere.path().to_path_buf(),
+        env: None,
     };
     let config = load_config(&opts).unwrap();
 

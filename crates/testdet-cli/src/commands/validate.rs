@@ -17,8 +17,9 @@ pub struct ValidateArgs {
     pub config: Option<PathBuf>,
     /// Output format (`--format`).
     pub format: Format,
-    /// Explicit `--env`; accepted and ignored in v1 (validate is
-    /// environment-independent).
+    /// Explicit `--env`; selects the secrets declaration file used to
+    /// classify `{{env.*}}` references (defaults to the manifest's
+    /// `defaultEnvironment`, then the synthetic `local`).
     pub env: Option<String>,
 }
 
@@ -34,9 +35,6 @@ pub fn run(args: ValidateArgs) -> (Exit, String) {
         return (Exit::Usage, crate::commands::ndjson_usage_error());
     }
 
-    // `env` is accepted but ignored in v1: validation is environment-independent.
-    let _ = args.env.as_ref();
-
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
         Err(error) => {
@@ -50,6 +48,7 @@ pub fn run(args: ValidateArgs) -> (Exit, String) {
     let (config, mut diagnostics) = load_with_diagnostics(&LoadOptions {
         config: args.config,
         cwd,
+        env: args.env,
     });
 
     // Surface unset-secret warnings (ruling 6): a declared-but-unset reference

@@ -199,7 +199,7 @@ pub fn secret_warnings(config: &Config) -> Diagnostics {
 
 /// `source: env`: the shell, then the declaration default.
 struct ShellSource {
-    declaration: SecretsDeclaration,
+    declaration: Option<SecretsDeclaration>,
 }
 
 impl SecretSource for ShellSource {
@@ -214,7 +214,10 @@ impl SecretSource for ShellSource {
     }
 
     fn names(&self) -> Vec<String> {
-        self.declaration.0.keys().cloned().collect()
+        self.declaration
+            .as_ref()
+            .map(|d| d.0.keys().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -223,7 +226,7 @@ impl SecretSource for ShellSource {
 struct DotenvSource {
     path: Option<PathBuf>,
     values: BTreeMap<String, String>,
-    declaration: SecretsDeclaration,
+    declaration: Option<SecretsDeclaration>,
 }
 
 impl SecretSource for DotenvSource {
@@ -246,13 +249,16 @@ impl SecretSource for DotenvSource {
     }
 
     fn names(&self) -> Vec<String> {
-        self.declaration.0.keys().cloned().collect()
+        self.declaration
+            .as_ref()
+            .map(|d| d.0.keys().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
 /// The declaration `default:` fallback, or the fully-unset lookup.
-fn default_lookup(declaration: &SecretsDeclaration, name: &str) -> Lookup {
-    if let Some(spec) = declaration.0.get(name)
+fn default_lookup(declaration: &Option<SecretsDeclaration>, name: &str) -> Lookup {
+    if let Some(spec) = declaration.as_ref().and_then(|d| d.0.get(name))
         && let Some(default) = &spec.default_value
     {
         return Lookup {
@@ -281,7 +287,10 @@ fn collect_requirements(config: &Config) -> BTreeMap<String, VarRequirement> {
                     requirements
                         .entry(name.clone())
                         .or_insert_with(|| VarRequirement {
-                            declared: config.secrets.0.contains_key(name),
+                            declared: config
+                                .secrets
+                                .as_ref()
+                                .is_some_and(|d| d.0.contains_key(name)),
                             set: false,
                             origin: None,
                             used_by: Vec::new(),

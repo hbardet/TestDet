@@ -52,9 +52,11 @@ impl Document {
 
         let docs = MarkedYaml::load_from_str(&source).map_err(|error| {
             let span = span_of(error.marker());
-            // saphyr reports a duplicate mapping key with this exact info
-            // string; every other scan failure is a malformed document.
-            let code = if error.info().contains("duplicated key") {
+            // saphyr reports a duplicate mapping key with an info string
+            // containing "duplicated key"; match case-insensitively on
+            // "duplicate" so a wording change still classifies correctly.
+            // Every other scan failure is a malformed document.
+            let code = if error.info().to_lowercase().contains("duplicate") {
                 codes::E_DUPLICATE_KEY
             } else {
                 codes::E_WRONG_TYPE
@@ -102,7 +104,7 @@ impl Document {
         spans.insert(String::new(), span_of(&root_node.span.start));
 
         let mut diags = Diagnostics::new();
-        let root = build(root_node, "", path, &mut spans, &mut diags);
+        let root = build(root_node, "", path, &mut spans, &mut diags, &source);
         if diags.has_errors() {
             return Err(diags);
         }
@@ -217,15 +219,16 @@ fn build(
     file: &Path,
     spans: &mut BTreeMap<String, Span>,
     diags: &mut Diagnostics,
+    source: &str,
 ) -> serde_json::Value {
     match &node.data {
-        YamlData::Value(scalar) => scalar_to_json(scalar),
+        YamlData::Value(scalar) => scalar_to_json(scalar, node_literal(source, node)),
         YamlData::Sequence(items) => {
             let mut array = Vec::with_capacity(items.len());
             for (index, item) in items.iter().enumerate() {
                 let child = join(path, &index.to_string());
                 spans.insert(child.clone(), span_of(&item.span.start));
-                array.push(build(item, &child, file, spans, diags));
+                array.push(build(item, &child, file, spans, diags, source));
             }
             serde_json::Value::Array(array)
         }
@@ -251,17 +254,38 @@ fn build(
                     continue;
                 }
                 spans.insert(child.clone(), span_of(&key.span.start));
-                object.insert(key_str, build(value, &child, file, spans, diags));
+                object.insert(key_str, build(value, &child, file, spans, diags, source));
             }
             serde_json::Value::Object(object)
         }
-        YamlData::Tagged(_, inner) => build(inner, path, file, spans, diags),
+        YamlData::Tagged(_, inner) => build(inner, path, file, spans, diags, source),
         YamlData::Representation(raw, _, _) => serde_json::Value::String(raw.to_string()),
         // Aliases are transparently expanded by saphyr before we see the tree,
         // and BadValue means a scalar could not be resolved; neither is
         // reachable through the default loader in normal operation.
         YamlData::Alias(_) | YamlData::BadValue => serde_json::Value::Null,
     }
+}
+
+/// The source text of a node, recovered from its span (`start`/`end` marker
+/// character indices) — the span indices are character offsets, so they are
+/// converted to byte offsets before slicing.
+fn node_literal<'a>(source: &'a str, node: &MarkedYaml) -> Option<&'a str> {
+    let start = char_to_byte(source, node.span.start.index())?;
+    let end = char_to_byte(source, node.span.end.index()).unwrap_or(source.len());
+    if end > start {
+        source.get(start..end)
+    } else {
+        None
+    }
+}
+
+/// The byte offset of the character at index `target` (0 = first character).
+fn char_to_byte(source: &str, target: usize) -> Option<usize> {
+    if target == 0 {
+        return Some(0);
+    }
+    source.char_indices().nth(target).map(|(byte, _)| byte)
 }
 
 /// The JSON object key for a scalar mapping key, or `None` for a complex key.
@@ -281,13 +305,24 @@ fn key_string(key: &MarkedYaml) -> Option<String> {
 /// integers stay integers (never `f64`), YAML 1.2 booleans (`true`/`false`)
 /// become JSON booleans, `null`/`~` become JSON null, and everything else
 /// (including `NO` and unquoted dates) stays a string.
-fn scalar_to_json(scalar: &Scalar) -> serde_json::Value {
+fn scalar_to_json(scalar: &Scalar, literal: Option<&str>) -> serde_json::Value {
     match scalar {
         Scalar::Null => serde_json::Value::Null,
         Scalar::Boolean(b) => serde_json::Value::Bool(*b),
         Scalar::Integer(i) => serde_json::Value::Number((*i).into()),
         Scalar::FloatingPoint(f) => {
             let value = f.0;
+            // An integer too large for i64 arrives as `FloatingPoint`; when the
+            // literal has no `.`/exponent, preserve it as an arbitrary-precision
+            // integer built from the literal text.
+            if let Some(literal) = literal
+                && !literal.contains('.')
+                && !literal.contains('e')
+                && !literal.contains('E')
+                && let Ok(number) = literal.parse::<serde_json::Number>()
+            {
+                return serde_json::Value::Number(number);
+            }
             match serde_json::Number::from_f64(value) {
                 Some(number) => serde_json::Value::Number(number),
                 // `.inf`/`.nan` have no JSON number form; keep their text.

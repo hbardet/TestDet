@@ -51,6 +51,28 @@ fn renders_file_line_path_code_message_and_hint() {
 }
 
 #[test]
+fn renders_the_file_path_alone_when_there_is_no_span() {
+    let d = Diagnostic {
+        code: codes::E_UNKNOWN_ENV,
+        severity: Severity::Error,
+        file: Some("testdet/collection/a.yaml".into()),
+        span: None,
+        path: Some("vars.apiKey".into()),
+        message: "undeclared".into(),
+        hint: None,
+    };
+    let text = render_text(&Diagnostics::from(vec![d]));
+    assert!(
+        text.contains("testdet/collection/a.yaml"),
+        "the file path is printed even without a span: {text}"
+    );
+    assert!(
+        !text.contains("testdet/collection/a.yaml:1:1"),
+        "a missing span must not fabricate a line:column: {text}"
+    );
+}
+
+#[test]
 fn worst_severity_follows_the_exit_code_table() {
     let mut d = Diagnostics::new();
     assert_eq!(d.worst_severity(), None);

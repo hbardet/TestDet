@@ -23,6 +23,7 @@ fn from_cwd(dir: &Path) -> LoadOptions {
     LoadOptions {
         config: None,
         cwd: dir.to_path_buf(),
+        env: None,
     }
 }
 
@@ -204,6 +205,10 @@ fn every_env_token_is_declared_somewhere() {
     assert_eq!(hits.len(), 1, "exactly one undeclared env reference");
     let diagnostic = hits[0];
     assert_eq!(diagnostic.severity, Severity::Error);
+    assert!(
+        diagnostic.span.is_some(),
+        "cross-file diagnostics carry a span into the operation file"
+    );
     assert_eq!(diagnostic.path.as_deref(), Some("vars.apiKey"));
     assert_eq!(
         diagnostic.file.as_deref(),
@@ -317,5 +322,54 @@ fn an_unused_files_entry_is_a_warning() {
         diagnostic.message.contains("`extra`"),
         "message names the file, got: {:?}",
         diagnostic.message
+    );
+}
+
+#[test]
+fn a_config_without_a_secrets_directory_treats_env_references_as_required() {
+    let root = TempDir::new().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        "version: 1\nname: my-api\ndefaultEnvironment: dev\ncollections: [users]\n",
+    );
+    write(
+        root.path(),
+        "testdet/users/call.yaml",
+        "id: call\nrequest:\n  kind: http\n  method: GET\n  path: /call\n  headers:\n    Authorization: \"Bearer {{env.API_TOKEN}}\"\n",
+    );
+
+    // No testdet/secrets/ directory: the config is valid; the env reference is
+    // simply required/undeclared rather than an E_UNKNOWN_ENV error.
+    let config = load_config(&from_cwd(root.path())).unwrap();
+    assert!(config.operations.contains_key("call"));
+}
+
+#[test]
+fn malformed_templates_are_reported_by_validate() {
+    let root = TempDir::new().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        "version: 1\nname: my-api\ncollections: [users]\n",
+    );
+    write(
+        root.path(),
+        "testdet/users/call.yaml",
+        "id: call\nrequest:\n  kind: graphql\n  query: \"{{var.id\"\n  headers:\n    Authorization: \"{{ }}\"\n",
+    );
+
+    let diagnostics = load_config(&from_cwd(root.path())).unwrap_err();
+    let hits: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.code == codes::E_WRONG_TYPE)
+        .collect();
+
+    assert_eq!(hits.len(), 2, "one E_WRONG_TYPE per malformed template");
+    assert!(
+        hits.iter()
+            .all(|d| d.message.contains("malformed template")),
+        "each malformed diagnostic names the template, got: {:?}",
+        hits.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }

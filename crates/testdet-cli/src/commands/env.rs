@@ -50,6 +50,7 @@ pub fn run(args: EnvArgs) -> (Exit, String) {
     let (config, diagnostics) = load_with_diagnostics(&LoadOptions {
         config: args.config,
         cwd,
+        env: args.env.clone(),
     });
     let Some(config) = config else {
         return (Exit::ConfigInvalid, render_text(&diagnostics));

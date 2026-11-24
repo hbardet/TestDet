@@ -243,3 +243,55 @@ fn parses_a_users_file() {
         Some("{{env.ADMIN_EMAIL}}")
     );
 }
+
+#[test]
+fn a_misspelled_transport_key_gets_a_did_you_mean_hint() {
+    let document = load_str(
+        "version: 1\ncollections: []\ndefaultEnvironment: staging\nenvironments:\n  staging:\n    baseUrl: https://staging.example.com\n    transport:\n      timeuot: 5\n",
+    )
+    .expect("loadable YAML");
+
+    let diagnostics = parse_manifest(&document).expect_err("unknown transport key");
+
+    let unknown = diagnostics
+        .iter()
+        .find(|d| d.code == codes::E_UNKNOWN_FIELD)
+        .expect("the unknown `timeuot` field is reported");
+    assert_eq!(
+        unknown.path.as_deref(),
+        Some("environments.staging.transport.timeuot")
+    );
+    assert!(
+        unknown
+            .hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("timeout")),
+        "hint suggests `timeout`, got: {:?}",
+        unknown.hint
+    );
+}
+
+#[test]
+fn a_request_without_a_kind_reports_the_missing_discriminator_and_the_rule() {
+    let document =
+        load_str("id: op\nrequest:\n  body:\n    kind: form\n    value:\n      a:\n        b: 1\n")
+            .expect("loadable YAML");
+
+    let diagnostics = parse_operation(&document).expect_err("a request without `kind` is invalid");
+
+    let flat = diagnostics
+        .iter()
+        .find(|d| d.code == codes::E_FLAT_BODY_ONLY)
+        .expect("the nested form value is reported");
+    assert_eq!(flat.path.as_deref(), Some("request.body.value.a"));
+
+    let collapse = diagnostics
+        .iter()
+        .find(|d| d.code == codes::E_WRONG_TYPE && d.path.as_deref() == Some("request"))
+        .expect("the missing discriminator is reported");
+    assert!(
+        collapse.message.contains("missing discriminator"),
+        "message reports the missing `kind`, got: {:?}",
+        collapse.message
+    );
+}

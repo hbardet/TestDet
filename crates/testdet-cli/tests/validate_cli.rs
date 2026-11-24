@@ -131,6 +131,48 @@ fn unset_declared_secret_is_a_warning_that_exits_zero() {
 }
 
 #[test]
+fn env_flag_selects_the_declaration_file() {
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        "version: 1\nname: my-api\ncollections: [ops]\ndefaultEnvironment: staging\nenvironments:\n  staging:\n    baseUrl: https://staging.example.com\n  prod:\n    baseUrl: https://prod.example.com\n",
+    );
+    write(
+        root.path(),
+        "testdet/secrets/staging.yaml",
+        "TOKEN:\n  description: staging token\n",
+    );
+    write(
+        root.path(),
+        "testdet/secrets/prod.yaml",
+        "OTHER:\n  description: unrelated\n",
+    );
+    write(
+        root.path(),
+        "testdet/ops/login.yaml",
+        "id: login\nrequest:\n  kind: http\n  method: GET\n  path: /login/{{env.TOKEN}}\n",
+    );
+    let config = root.path().join("testdet/testdet.yaml");
+
+    // No --env: the default environment's (staging) declaration declares TOKEN.
+    let (exit, output) = validate(Some(config.clone()), Format::Text);
+    assert_eq!(exit, Exit::Ok, "staging declares TOKEN: {output}");
+
+    // --env prod: prod's declaration omits TOKEN → E_UNKNOWN_ENV.
+    let (exit, output) = validate::run(ValidateArgs {
+        config: Some(config),
+        format: Format::Text,
+        env: Some("prod".to_string()),
+    });
+    assert_eq!(exit, Exit::ConfigInvalid);
+    assert!(
+        output.contains("E_UNKNOWN_ENV"),
+        "prod does not declare TOKEN: {output}"
+    );
+}
+
+#[test]
 fn ndjson_is_a_usage_error_for_validate() {
     let (_root, config) = build_config(clean_operation(), "upload.yaml");
     let (exit, output) = validate(Some(config), Format::Ndjson);

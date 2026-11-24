@@ -27,10 +27,13 @@ use crate::operation::model::Operation;
 
 /// How to locate the config: an explicit `--config` path, plus the working
 /// directory used for upward discovery when `config` is `None`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LoadOptions {
     pub config: Option<PathBuf>,
     pub cwd: PathBuf,
+    /// The `--env` selection: picks `secrets/<env>.yaml`. `None` falls back
+    /// to the manifest's `defaultEnvironment`, then the synthetic `local`.
+    pub env: Option<String>,
 }
 
 /// The fully loaded config: manifest, the directory it lives in, and every
@@ -45,13 +48,21 @@ pub struct Config {
     pub root_dir: PathBuf,
     pub operations: BTreeMap<String, Operation>,
     pub users: BTreeMap<String, User>,
-    pub secrets: SecretsDeclaration,
+    /// The secrets declaration loaded from `secrets/<env>.yaml`; `None` when
+    /// no declaration file exists for the resolved environment.
+    pub secrets: Option<SecretsDeclaration>,
+    /// The environment name the secrets declaration was resolved for (`--env`,
+    /// then `defaultEnvironment`, then the synthetic `local`).
+    pub secrets_env: String,
     /// `defaultLogin` from the users file; `None` when the file is absent.
     pub default_login: Option<String>,
     /// Operation id → the operation file that declared it. Cross-file
     /// validation (Task 11) uses this to attach each diagnostic to the
     /// operation file that owns the offending reference.
     pub operation_files: BTreeMap<String, PathBuf>,
+    /// Operation file path → the parsed document, so cross-file diagnostics
+    /// can attach exact spans without re-reading the file.
+    pub documents: BTreeMap<PathBuf, Document>,
 }
 
 /// Locate the manifest file, returning its path.
@@ -147,8 +158,10 @@ fn build(opts: &LoadOptions) -> (Option<Config>, Diagnostics) {
 
     let mut operations = BTreeMap::new();
     let mut operation_files = BTreeMap::new();
+    let mut documents = BTreeMap::new();
+    let mut sources = BTreeMap::new();
     let mut users = BTreeMap::new();
-    let mut secrets = SecretsDeclaration::default();
+    let mut secrets = None;
     let mut default_login = None;
 
     // Collections: order preserved, duplicates allowed and harmless.
@@ -174,6 +187,8 @@ fn build(opts: &LoadOptions) -> (Option<Config>, Diagnostics) {
             &root_dir,
             &mut operations,
             &mut operation_files,
+            &mut documents,
+            &mut sources,
             &mut diagnostics,
         );
     }
@@ -191,20 +206,25 @@ fn build(opts: &LoadOptions) -> (Option<Config>, Diagnostics) {
     }
 
     // Secrets declaration (`<root_dir>/secrets/<env>.yaml`): optional; invalid
-    // → diagnostics. Missing default environment or file → empty declaration.
-    if let Some(env) = &manifest.default_environment {
-        let secrets_path = root_dir.join("secrets").join(format!("{env}.yaml"));
-        if secrets_path.is_file() {
-            match Document::load(&secrets_path).and_then(|doc| {
-                deserialize_validated::<SecretsDeclaration>(
-                    &doc,
-                    &schema::secrets(),
-                    SchemaKind::Secrets,
-                )
-            }) {
-                Ok(declaration) => secrets = declaration,
-                Err(err) => diagnostics.extend(err.iter().cloned()),
-            }
+    // → diagnostics. The environment is chosen by `--env`, then the manifest's
+    // `defaultEnvironment`, then the synthetic `local`. A missing file leaves
+    // the declaration `None` (no declaration file).
+    let env = opts
+        .env
+        .clone()
+        .or_else(|| manifest.default_environment.clone())
+        .unwrap_or_else(|| "local".to_string());
+    let secrets_path = root_dir.join("secrets").join(format!("{env}.yaml"));
+    if secrets_path.is_file() {
+        match Document::load(&secrets_path).and_then(|doc| {
+            deserialize_validated::<SecretsDeclaration>(
+                &doc,
+                &schema::secrets(),
+                SchemaKind::Secrets,
+            )
+        }) {
+            Ok(declaration) => secrets = Some(declaration),
+            Err(err) => diagnostics.extend(err.iter().cloned()),
         }
     }
 
@@ -216,8 +236,10 @@ fn build(opts: &LoadOptions) -> (Option<Config>, Diagnostics) {
         operations,
         users,
         secrets,
+        secrets_env: env,
         default_login,
         operation_files,
+        documents,
     };
     (Some(config), diagnostics)
 }
@@ -311,13 +333,12 @@ fn scan_collection(
     root_dir: &Path,
     operations: &mut BTreeMap<String, Operation>,
     operation_files: &mut BTreeMap<String, PathBuf>,
+    documents: &mut BTreeMap<PathBuf, Document>,
+    sources: &mut BTreeMap<String, PathBuf>,
     diagnostics: &mut Diagnostics,
 ) {
     let mut files = Vec::new();
     collect_yaml_files(dir, &mut files);
-
-    // First-seen file path per id, so a duplicate can name both files.
-    let mut sources: BTreeMap<String, PathBuf> = BTreeMap::new();
 
     for file in files {
         let doc = match Document::load(&file) {
@@ -374,6 +395,7 @@ fn scan_collection(
             });
         }
 
+        documents.insert(file.clone(), doc);
         sources.insert(operation.id.clone(), file.clone());
         operations.insert(operation.id.clone(), operation.clone());
         operation_files.insert(operation.id, file);

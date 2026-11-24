@@ -17,9 +17,9 @@ use serde_json::Value;
 
 use crate::config::discover::Config;
 use crate::config::model::{HeaderMap, User};
-use crate::diagnostic::{Diagnostic, Diagnostics, Severity, codes};
+use crate::diagnostic::{Diagnostic, Diagnostics, Severity, Span, codes};
 use crate::operation::model::{Body, Operation, Request};
-use crate::template::value::{Reference, Token, references};
+use crate::template::value::{Reference, Token, malformed, references};
 
 /// Validate every cross-file rule over the whole config.
 ///
@@ -52,6 +52,21 @@ pub fn check_value(value: &Value, owner: &str, config: &Config, out: &mut Diagno
     for reference in references(value) {
         check_reference(&reference, owner, &file, config, out);
     }
+    for occurrence in malformed(value) {
+        out.push(Diagnostic {
+            code: codes::E_WRONG_TYPE,
+            severity: Severity::Error,
+            file: file.clone(),
+            span: span_for_reference(config, &file, &occurrence.path),
+            path: Some(occurrence.path.clone()),
+            message: format!(
+                "malformed template `{raw}` in `{owner}`: {reason}",
+                raw = occurrence.raw,
+                reason = occurrence.reason
+            ),
+            hint: None,
+        });
+    }
 }
 
 /// Apply the cross-file rules to one well-formed reference.
@@ -63,6 +78,7 @@ fn check_reference(
     out: &mut Diagnostics,
 ) {
     let operation = config.operations.get(owner);
+    let span = span_for_reference(config, file, &reference.path);
     match &reference.token {
         Token::File(name) => {
             let declared = operation.is_some_and(|op| op.files.contains_key(name));
@@ -71,7 +87,7 @@ fn check_reference(
                     code: codes::E_UNKNOWN_FILE,
                     severity: Severity::Error,
                     file: file.clone(),
-                    span: None,
+                    span,
                     path: Some(reference.path.clone()),
                     message: format!("file `{name}` is referenced but not declared in `{owner}`"),
                     hint: Some(file_names_hint(operation)),
@@ -79,19 +95,26 @@ fn check_reference(
             }
         }
         Token::Env(name) => {
-            if !config.secrets.0.contains_key(name) {
+            // §7.11: a missing declaration file treats every reference as
+            // required, so a reference is only an error when a declaration
+            // file exists and omits the name.
+            let undeclared = config
+                .secrets
+                .as_ref()
+                .is_some_and(|secrets| !secrets.0.contains_key(name));
+            if undeclared {
                 out.push(Diagnostic {
                     code: codes::E_UNKNOWN_ENV,
                     severity: Severity::Error,
                     file: file.clone(),
-                    span: None,
+                    span,
                     path: Some(reference.path.clone()),
                     message: format!("secret `{name}` is not declared in `{owner}`"),
                     hint: Some(secrets_file_hint(name, config)),
                 });
             }
         }
-        Token::Session(name) => check_session(name, owner, file, config, out, reference),
+        Token::Session(name) => check_session(name, owner, file, config, out, reference, &span),
         Token::Var(_) => {
             // `var` resolution is a within-config concern (operation/env/user
             // layers), owned by Task 10 and the runtime — not cross-file.
@@ -122,7 +145,7 @@ fn check_default_login(config: &Config, out: &mut Diagnostics) {
 fn check_per_user_logins(config: &Config, out: &mut Diagnostics) {
     let users_file = config.root_dir.join("users.yaml");
     for (name, user) in &config.users {
-        let Some(login) = &user.login else {
+        let Some(login) = user.login.as_ref().and_then(|login| login.as_deref()) else {
             continue;
         };
         if config.operations.contains_key(login) {
@@ -149,11 +172,17 @@ fn check_session(
     config: &Config,
     out: &mut Diagnostics,
     reference: &Reference,
+    span: &Option<Span>,
 ) {
     // Effective login id per user: `user.login` overrides `defaultLogin`.
     let mut login_users: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (user_name, user) in &config.users {
-        if let Some(login) = user.login.clone().or_else(|| config.default_login.clone()) {
+        if let Some(login) = user
+            .login
+            .clone()
+            .flatten()
+            .or_else(|| config.default_login.clone())
+        {
             login_users
                 .entry(login)
                 .or_default()
@@ -167,7 +196,7 @@ fn check_session(
             code: codes::E_UNKNOWN_VAR,
             severity: Severity::Error,
             file: file.clone(),
-            span: None,
+            span: *span,
             path: Some(reference.path.clone()),
             message: format!(
                 "`{raw}` in `{owner}` references a session that no login provides",
@@ -227,7 +256,7 @@ fn check_session(
         code: codes::E_UNKNOWN_VAR,
         severity: Severity::Error,
         file: file.clone(),
-        span: None,
+        span: *span,
         path: Some(reference.path.clone()),
         message: format!(
             "`{raw}` in `{owner}` is not captured by the login operation {login_list}",
@@ -246,6 +275,41 @@ fn credential_matches(user: &User, name: &str) -> bool {
     }
     name.strip_prefix("credentials.")
         .is_some_and(|key| user.credentials.contains_key(key))
+}
+
+/// The source span for a reference path, resolved against the owning
+/// operation's document. Scan-surface paths (`variables.email`, `body.value.x`,
+/// `headers.Authorization`) are mapped onto the on-disk document (`request.…`)
+/// before lookup; the lookup then walks up to parent paths until a span is
+/// found (e.g. `request.variables.avatar` → `request.variables`).
+fn span_for_reference(
+    config: &Config,
+    file: &Option<PathBuf>,
+    reference_path: &str,
+) -> Option<Span> {
+    let file = file.as_ref()?;
+    let document = config.documents.get(file)?;
+    let mut path = on_disk_path(reference_path);
+    loop {
+        if let Some(span) = document.span_at(&path) {
+            return Some(span);
+        }
+        let index = path.rfind('.')?;
+        path.truncate(index);
+    }
+}
+
+/// Map a scan-surface reference path onto the on-disk document path. Request
+/// content is wrapped under `request.` in the operation file; `vars` and
+/// `capture` are top-level and match directly.
+fn on_disk_path(path: &str) -> String {
+    if path.starts_with("request.") {
+        return path.to_string();
+    }
+    match path.split('.').next().unwrap_or(path) {
+        "query" | "variables" | "headers" | "path" | "body" | "method" => format!("request.{path}"),
+        _ => path.to_string(),
+    }
 }
 
 /// Warn for a `files` entry of an operation that no `{{file.*}}` reference in
@@ -267,11 +331,15 @@ fn check_unused_files(
     let file = config.operation_files.get(id).cloned();
     for name in operation.files.keys() {
         if !used.contains(name) {
+            let span = file
+                .as_ref()
+                .and_then(|file| config.documents.get(file))
+                .and_then(|doc| doc.span_at(&format!("files.{name}")));
             out.push(Diagnostic {
                 code: codes::W_UNUSED_VAR,
                 severity: Severity::Warning,
                 file: file.clone(),
-                span: None,
+                span,
                 path: Some(format!("files.{name}")),
                 message: format!("file `{name}` is declared but never referenced"),
                 hint: None,
@@ -372,14 +440,11 @@ fn file_names_hint(operation: Option<&Operation>) -> String {
     format!("declared files: {names}")
 }
 
-/// The `E_UNKNOWN_ENV` hint names the secrets declaration file, using the
-/// manifest's `defaultEnvironment` when present.
+/// The `E_UNKNOWN_ENV` hint names the secrets declaration file for the
+/// environment the declaration was loaded from, falling back to the synthetic
+/// `local` environment.
 fn secrets_file_hint(name: &str, config: &Config) -> String {
-    let env = config
-        .manifest
-        .default_environment
-        .as_deref()
-        .unwrap_or("<env>");
+    let env = &config.secrets_env;
     format!("declare `{name}` in testdet/secrets/{env}.yaml")
 }
 

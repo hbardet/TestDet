@@ -34,9 +34,10 @@ pub(crate) fn merge_vars(base: &mut BTreeMap<String, Value>, overlay: &BTreeMap<
 
 /// Field-wise merge of an environment override over a declared user.
 ///
-/// Scalar fields replace (`token`, `tokenHeader`, `login`) with `Option::None`
-/// meaning "keep the inherited value"; maps merge key by key (`credentials`,
-/// `vars`); and `headers` merge with `None` meaning "unset".
+/// Scalar fields (`token`, `tokenHeader`, `login`) are doubly-optional:
+/// absent keeps the inherited value, an explicit `null` (`Some(None)`) unsets
+/// it, and a value (`Some(Some(v))`) replaces it; maps merge key by key
+/// (`credentials`, `vars`); and `headers` merge with `None` meaning "unset".
 pub(crate) fn merge_user(base: &User, overlay: &User) -> User {
     let mut merged = base.clone();
 

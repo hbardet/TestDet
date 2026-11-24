@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use testdet_core::config::discover::{Config, LoadOptions, load_config};
-use testdet_core::config::model::{HeaderMap, Manifest, SecretsDeclaration, User};
+use testdet_core::config::model::{HeaderMap, Manifest, User};
 use testdet_core::config::resolve::resolve;
 use testdet_core::diagnostic::{Severity, codes};
 use testdet_core::operation::model::{GraphqlRequest, Operation, Request};
@@ -24,6 +24,7 @@ fn load_options(dir: &Path) -> LoadOptions {
     LoadOptions {
         config: None,
         cwd: dir.to_path_buf(),
+        env: None,
     }
 }
 
@@ -49,9 +50,11 @@ fn config_with(
         root_dir: PathBuf::from("/tmp/testdet"),
         operations: BTreeMap::new(),
         users,
-        secrets: SecretsDeclaration::default(),
+        secrets: None,
+        secrets_env: "local".to_string(),
         default_login,
         operation_files: BTreeMap::new(),
+        documents: BTreeMap::new(),
     }
 }
 
@@ -107,7 +110,7 @@ fn headers_merge_defaults_then_env_then_user_then_operation() {
         "alice".to_string(),
         user_from(json!({ "headers": { "X-Layer": "user", "X-User-Only": "u" } })),
     )]);
-    let config = config_with(manifest, users, Some("alice".to_string()));
+    let config = config_with(manifest, users, None);
     let resolved = resolve(&config, None, &[]).unwrap();
     let operation = graphql_op(
         headers(&[("X-Layer", Some("operation")), ("X-Op-Only", Some("o"))]),
@@ -121,6 +124,33 @@ fn headers_merge_defaults_then_env_then_user_then_operation() {
     assert_eq!(header(&merged, "X-Env-Only"), Some("e"));
     assert_eq!(header(&merged, "X-User-Only"), Some("u"));
     assert_eq!(header(&merged, "X-Op-Only"), Some("o"));
+}
+
+#[test]
+fn a_user_named_login_is_not_implicitly_applied_when_no_user_is_selected() {
+    let manifest = manifest_from(json!({
+        "version": 1,
+        "collections": [],
+        "defaultEnvironment": "local",
+        "defaults": { "headers": { "X-Base": "b" } },
+        "environments": {
+            "local": { "baseUrl": "http://localhost:8080" }
+        }
+    }));
+    let users = BTreeMap::from([(
+        "login".to_string(),
+        user_from(json!({ "headers": { "X-Login-User": "sneaky" } })),
+    )]);
+    // `defaultLogin` names an operation, never a user; a user literally named
+    // `login` must not leak into the headers of an anonymous request.
+    let config = config_with(manifest, users, Some("login".to_string()));
+    let resolved = resolve(&config, None, &[]).unwrap();
+    let operation = graphql_op(HeaderMap::default(), BTreeMap::new());
+
+    let merged = resolved.headers_for(&operation, None);
+
+    assert_eq!(header(&merged, "X-Login-User"), None);
+    assert_eq!(header(&merged, "X-Base"), Some("b"));
 }
 
 #[test]
@@ -164,7 +194,7 @@ fn vars_precedence_is_operation_env_user_then_cli() {
         "alice".to_string(),
         user_from(json!({ "vars": { "userId": "user", "userOnly": "u" } })),
     )]);
-    let config = config_with(manifest, users, Some("alice".to_string()));
+    let config = config_with(manifest, users, None);
     let operation = graphql_op(
         HeaderMap::default(),
         BTreeMap::from([("userId".to_string(), Value::String("op".into()))]),
@@ -269,6 +299,48 @@ users:
 }
 
 #[test]
+fn an_environment_may_unset_a_users_file_token_with_null() {
+    let root = TempDir::new().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        r#"
+version: 1
+name: my-api
+defaultEnvironment: staging
+collections: []
+environments:
+  staging:
+    baseUrl: https://staging.example.com
+    users:
+      admin:
+        token: null
+"#,
+    );
+    write(
+        root.path(),
+        "testdet/users.yaml",
+        r#"
+users:
+  admin:
+    credentials:
+      email: "{{env.ADMIN_EMAIL}}"
+    token: "{{env.ADMIN_TOKEN}}"
+"#,
+    );
+
+    let config = load_config(&load_options(root.path())).unwrap();
+    let resolved = resolve(&config, None, &[]).unwrap();
+
+    let admin = resolved.users.get("admin").expect("admin survives");
+    assert_eq!(
+        admin.token,
+        Some(None),
+        "`token: null` unsets the users-file token"
+    );
+}
+
+#[test]
 fn default_environment_must_name_a_declared_environment() {
     let manifest = manifest_from(json!({
         "version": 1,
@@ -299,6 +371,20 @@ fn no_environments_block_means_a_single_local_env_from_top_level_base_url() {
     }));
     let config = config_with(manifest, BTreeMap::new(), None);
     let resolved = resolve(&config, None, &[]).unwrap();
+
+    assert_eq!(resolved.env_name, "local");
+    assert_eq!(resolved.base_url.as_str(), "http://localhost:8080/");
+}
+
+#[test]
+fn an_explicit_local_env_is_accepted_on_a_shorthand_config() {
+    let manifest = manifest_from(json!({
+        "version": 1,
+        "collections": [],
+        "baseUrl": "http://localhost:8080"
+    }));
+    let config = config_with(manifest, BTreeMap::new(), None);
+    let resolved = resolve(&config, Some("local"), &[]).unwrap();
 
     assert_eq!(resolved.env_name, "local");
     assert_eq!(resolved.base_url.as_str(), "http://localhost:8080/");

@@ -47,6 +47,7 @@ pub fn run(args: ShowArgs) -> (Exit, String) {
     let config = match load_config(&LoadOptions {
         config: args.config,
         cwd,
+        ..Default::default()
     }) {
         Ok(config) => config,
         Err(diagnostics) => return (Exit::ConfigInvalid, render_text(&diagnostics)),

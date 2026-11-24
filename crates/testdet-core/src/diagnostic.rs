@@ -129,8 +129,9 @@ impl From<Vec<Diagnostic>> for Diagnostics {
 /// hint: text
 /// ```
 ///
-/// A diagnostic with no `file` *and* no `span` omits the location line; one
-/// with no `path` omits the path line; one with no `hint` omits the hint line.
+/// A diagnostic with no `file` omits the location line; a `file` without a
+/// `span` prints the file path alone; one with no `path` omits the path line;
+/// one with no `hint` omits the hint line.
 pub fn render_text(diagnostics: &Diagnostics) -> String {
     let mut out = String::new();
     for (i, diagnostic) in diagnostics.iter().enumerate() {
@@ -138,9 +139,16 @@ pub fn render_text(diagnostics: &Diagnostics) -> String {
             out.push('\n');
         }
 
-        if let (Some(file), Some(span)) = (&diagnostic.file, diagnostic.span) {
-            out.push_str(&format!("{}:{}:{}", file.display(), span.line, span.column));
-            out.push('\n');
+        match (&diagnostic.file, diagnostic.span) {
+            (Some(file), Some(span)) => {
+                out.push_str(&format!("{}:{}:{}", file.display(), span.line, span.column));
+                out.push('\n');
+            }
+            (Some(file), None) => {
+                out.push_str(&file.display().to_string());
+                out.push('\n');
+            }
+            (None, _) => {}
         }
 
         if let Some(path) = &diagnostic.path {

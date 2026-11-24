@@ -63,6 +63,21 @@ fn preserves_integers_beyond_f64() {
 }
 
 #[test]
+fn integers_beyond_u64_round_trip_exactly() {
+    let document = load_str("huge: 99999999999999999999\n").expect("valid document");
+    let huge = &document.root()["huge"];
+    assert!(huge.is_number(), "expected a number, got {huge:?}");
+    assert_eq!(huge.to_string(), "99999999999999999999");
+}
+
+#[test]
+fn floats_and_exponents_still_arrive_as_numbers() {
+    let document = load_str("a: 1.5\nb: 1e3\n").expect("valid document");
+    assert_eq!(document.root()["a"].as_f64(), Some(1.5));
+    assert_eq!(document.root()["b"].as_f64(), Some(1000.0));
+}
+
+#[test]
 fn rejects_a_non_map_top_level_with_a_span() {
     for source in ["", "- a\n- b", "just a string"] {
         let diagnostics = load_str(source).expect_err("non-mapping top level");

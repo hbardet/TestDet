@@ -27,6 +27,18 @@ pub struct Reference {
     pub path: String,
 }
 
+/// One malformed `{{...}}` occurrence inside a JSON value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Malformed {
+    /// Dotted object keys with bare-number array indices.
+    pub path: String,
+    /// The raw text that failed to parse: the full `{{...}}` expression, or
+    /// the unterminated `{{` up to the end of the string.
+    pub raw: String,
+    /// Why it is malformed.
+    pub reason: String,
+}
+
 /// A segment of a scanned string: either literal text or one expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Segment {
@@ -121,6 +133,17 @@ pub fn references(value: &Value) -> Vec<Reference> {
     out
 }
 
+/// Collect every malformed expression inside `value`, in document order.
+///
+/// A malformed occurrence is either a `{{...}}` whose inner text fails
+/// [`parse_token`], or an unterminated `{{` (no closing `}}`). This is the
+/// complement of [`references`]: every `{{` appears in exactly one of the two.
+pub fn malformed(value: &Value) -> Vec<Malformed> {
+    let mut out = Vec::new();
+    collect_malformed(value, "", &mut out);
+    out
+}
+
 fn collect_references(value: &Value, path: &str, out: &mut Vec<Reference>) {
     match value {
         Value::String(s) => {
@@ -155,6 +178,54 @@ fn collect_references(value: &Value, path: &str, out: &mut Vec<Reference>) {
             }
         }
         _ => {}
+    }
+}
+
+fn collect_malformed(value: &Value, path: &str, out: &mut Vec<Malformed>) {
+    match value {
+        Value::String(s) => collect_malformed_string(s, path, out),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                collect_malformed(item, &join_path(path, &index.to_string()), out);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                collect_malformed(item, &join_path(path, key), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_malformed_string(s: &str, path: &str, out: &mut Vec<Malformed>) {
+    let mut cursor = 0;
+    while let Some(relative) = s[cursor..].find("{{") {
+        let start = cursor + relative;
+        let after_open = start + 2;
+        match s[after_open..].find("}}") {
+            Some(close_relative) => {
+                let close = after_open + close_relative;
+                let raw = &s[start..close + 2];
+                let inner = &s[after_open..close];
+                if let Err(reason) = parse_token(inner) {
+                    out.push(Malformed {
+                        path: path.to_string(),
+                        raw: raw.to_string(),
+                        reason,
+                    });
+                }
+                cursor = close + 2;
+            }
+            None => {
+                out.push(Malformed {
+                    path: path.to_string(),
+                    raw: s[start..].to_string(),
+                    reason: "unterminated expression: missing `}}`".to_string(),
+                });
+                break;
+            }
+        }
     }
 }
 

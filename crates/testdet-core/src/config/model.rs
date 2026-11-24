@@ -12,6 +12,17 @@ use std::ops::Deref;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Deserialises an explicit `null` as `Some(None)` while a missing key stays
+/// `None`, so `token: null` (or `tokenHeader`/`login`) can UNSET a value
+/// inherited from the users file. §7.7, §7.19.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
 /// A config-format version marker.
 ///
 /// Only the integer `1` is accepted; anything else (including other integers)
@@ -121,17 +132,24 @@ pub struct Environment {
 ///
 /// All fields are optional so the same type serves both the full declaration
 /// in `users.yaml` and a partial per-environment override (spec §7.5, §7.7).
+///
+/// `token`, `tokenHeader` and `login` are doubly-optional: `None` means the
+/// field was absent (keep the inherited value during a merge), while
+/// `Some(None)` means an explicit `null` (unset the inherited value).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", default)]
 pub struct User {
     /// `credentials`, arbitrary string keys → string values.
     pub credentials: BTreeMap<String, String>,
     /// `token`, sugar for `Authorization: Bearer <token>`.
-    pub token: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub token: Option<Option<String>>,
     /// `tokenHeader`, renames the header that `token` fills.
-    pub token_header: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub token_header: Option<Option<String>>,
     /// `login`, an override of the users-file `defaultLogin`.
-    pub login: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub login: Option<Option<String>>,
     /// `vars`, per-user templating variables carrying typed JSON values (§7.8).
     pub vars: BTreeMap<String, serde_json::Value>,
     /// `headers`
@@ -190,12 +208,10 @@ pub struct SecretSpec {
 
 /// Transport settings (timeout / retries), §7.5.
 ///
-/// The spec names TLS as a third transport setting but does not pin its
-/// fields. TLS is intentionally not modelled yet, so this struct deliberately
-/// does **not** carry `deny_unknown_fields`: it must not reject a `tls:` key
-/// that a later task will model.
+/// Unknown transport keys are rejected: a misspelled `timeuot` must fail with
+/// `E_UNKNOWN_FIELD`, not be silently ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", default)]
 pub struct Transport {
     /// `timeout`
     pub timeout: Option<u64>,
