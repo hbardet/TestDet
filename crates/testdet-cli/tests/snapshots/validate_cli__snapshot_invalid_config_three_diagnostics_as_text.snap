@@ -1,0 +1,18 @@
+---
+source: crates/testdet-cli/tests/validate_cli.rs
+expression: output
+---
+<root>/testdet/users/bad.yaml:6:3
+  request.query
+E_FOREIGN_FIELD  `query` belongs to `kind: graphql`, not `kind: http`
+hint: remove it, or switch `request.kind`
+
+<root>/testdet/users/bad.yaml:7:3
+  request.operationName
+E_FOREIGN_FIELD  `operationName` belongs to `kind: graphql`, not `kind: http`
+hint: remove it, or switch `request.kind`
+
+<root>/testdet/users/bad.yaml:8:3
+  request.variables
+E_FOREIGN_FIELD  `variables` belongs to `kind: graphql`, not `kind: http`
+hint: remove it, or switch `request.kind`
