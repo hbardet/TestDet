@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{env, show, validate};
+use crate::commands::{config, env, show, validate};
 use crate::exit::Exit;
 use crate::format::Format;
 
@@ -36,7 +36,7 @@ enum Commands {
     /// Inspect environment variables.
     Env(EnvCli),
     /// Show the resolved configuration.
-    Config,
+    Config(ConfigCli),
     /// Emit the JSON Schema for the config.
     Schema,
     /// Show a resolved operation.
@@ -55,6 +55,22 @@ struct ValidateCli {
     /// (`testdet/secrets/<env>.yaml`).
     #[arg(long)]
     env: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct ConfigCli {
+    /// Explicit config path; otherwise discovered by walking up from the cwd.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Environment to resolve; defaults to the manifest `defaultEnvironment`.
+    #[arg(long)]
+    env: Option<String>,
+    /// User whose headers/vars layers are merged.
+    #[arg(long)]
+    user: Option<String>,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "text")]
+    format: Format,
 }
 
 #[derive(clap::Args)]
@@ -131,7 +147,19 @@ pub fn run(argv: Vec<OsString>) -> u8 {
             // stdout; diagnostics and usage errors are text and go to stderr.
             emit(exit, &output, format == Format::Json && exit == Exit::Ok)
         }
-        Commands::Tui | Commands::Run | Commands::Config | Commands::Schema => {
+        Commands::Config(args) => {
+            let format = args.format;
+            let (exit, output) = config::run(config::ConfigArgs {
+                config: args.config,
+                env: args.env,
+                user: args.user,
+                format,
+            });
+            // The JSON config view belongs on stdout on success; text output,
+            // diagnostics and usage errors go to stderr.
+            emit(exit, &output, format == Format::Json && exit == Exit::Ok)
+        }
+        Commands::Tui | Commands::Run | Commands::Schema => {
             eprintln!("not implemented");
             4
         }

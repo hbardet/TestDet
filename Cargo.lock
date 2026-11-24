@@ -1954,7 +1954,9 @@ dependencies = [
 name = "testdet-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "jsonschema",
+ "percent-encoding",
  "reqwest 0.12.28",
  "saphyr",
  "saphyr-parser",
