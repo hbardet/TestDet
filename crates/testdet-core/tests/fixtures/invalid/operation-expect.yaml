@@ -1,0 +1,6 @@
+id: op
+expect: 200
+request:
+  kind: http
+  method: GET
+  path: /x

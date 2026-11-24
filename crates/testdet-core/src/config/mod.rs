@@ -5,6 +5,7 @@
 
 pub mod document;
 pub mod model;
+pub mod parse;
 pub mod schema;
 pub mod validate;
 

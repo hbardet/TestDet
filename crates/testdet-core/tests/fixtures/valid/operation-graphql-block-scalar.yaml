@@ -1,0 +1,19 @@
+id: getUser
+description: Fetch one user by id.
+tags: [users, query]
+request:
+  kind: graphql
+  path: /graphql
+  query: |
+    query GetUser($id: ID!) {
+      user(id: $id) {
+        id
+        email
+        displayName
+      }
+    }
+  operationName: GetUser
+  variables:
+    id: "{{var.userId}}"
+vars:
+  userId: u_123

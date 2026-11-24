@@ -1,0 +1,10 @@
+id: nested
+request:
+  kind: http
+  method: POST
+  path: /submit
+  body:
+    kind: form
+    value:
+      a:
+        b: 1

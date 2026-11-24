@@ -1,0 +1,8 @@
+id: getUser
+request:
+  kind: graphql
+  method: GET
+  query: |
+    query GetUser {
+      user { id }
+    }
