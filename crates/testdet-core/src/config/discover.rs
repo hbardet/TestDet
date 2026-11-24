@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::Document;
+use crate::config::crosscheck::crosscheck;
 use crate::config::model::{Manifest, SecretsDeclaration, User};
 use crate::config::parse::{deserialize_validated, parse_manifest, parse_operation, parse_users};
 use crate::config::schema;
@@ -47,6 +48,10 @@ pub struct Config {
     pub secrets: SecretsDeclaration,
     /// `defaultLogin` from the users file; `None` when the file is absent.
     pub default_login: Option<String>,
+    /// Operation id → the operation file that declared it. Cross-file
+    /// validation (Task 11) uses this to attach each diagnostic to the
+    /// operation file that owns the offending reference.
+    pub operation_files: BTreeMap<String, PathBuf>,
 }
 
 /// Locate the manifest file, returning its path.
@@ -66,7 +71,11 @@ pub fn discover(opts: &LoadOptions) -> Result<PathBuf, Diagnostics> {
 /// problem found (warnings included); on success the config is returned and
 /// warnings are discarded (see [`load_diagnostics`] to collect them).
 pub fn load_config(opts: &LoadOptions) -> Result<Config, Diagnostics> {
-    let (config, diagnostics) = build(opts);
+    let (config, mut diagnostics) = build(opts);
+    if let Some(config) = &config {
+        diagnostics.extend(crosscheck(config).iter().cloned());
+    }
+    sort(&mut diagnostics);
     if diagnostics.has_errors() {
         return Err(diagnostics);
     }
@@ -79,7 +88,12 @@ pub fn load_config(opts: &LoadOptions) -> Result<Config, Diagnostics> {
 /// warnings included — without requiring a clean config. This is the hook
 /// Task 12 uses to recompute warnings for a config that loaded successfully.
 pub fn load_diagnostics(opts: &LoadOptions) -> Diagnostics {
-    build(opts).1
+    let (config, mut diagnostics) = build(opts);
+    if let Some(config) = &config {
+        diagnostics.extend(crosscheck(config).iter().cloned());
+    }
+    sort(&mut diagnostics);
+    diagnostics
 }
 
 /// The single pass: discover, load the manifest, scan collections, load the
@@ -119,6 +133,7 @@ fn build(opts: &LoadOptions) -> (Option<Config>, Diagnostics) {
     let root_dir = manifest_dir(&manifest_path);
 
     let mut operations = BTreeMap::new();
+    let mut operation_files = BTreeMap::new();
     let mut users = BTreeMap::new();
     let mut secrets = SecretsDeclaration::default();
     let mut default_login = None;
@@ -141,7 +156,13 @@ fn build(opts: &LoadOptions) -> (Option<Config>, Diagnostics) {
                 continue;
             }
         };
-        scan_collection(&resolved, &root_dir, &mut operations, &mut diagnostics);
+        scan_collection(
+            &resolved,
+            &root_dir,
+            &mut operations,
+            &mut operation_files,
+            &mut diagnostics,
+        );
     }
 
     // Users file (`<root_dir>/users.yaml`): optional; invalid → diagnostics.
@@ -183,6 +204,7 @@ fn build(opts: &LoadOptions) -> (Option<Config>, Diagnostics) {
         users,
         secrets,
         default_login,
+        operation_files,
     };
     (Some(config), diagnostics)
 }
@@ -275,6 +297,7 @@ fn scan_collection(
     dir: &Path,
     root_dir: &Path,
     operations: &mut BTreeMap<String, Operation>,
+    operation_files: &mut BTreeMap<String, PathBuf>,
     diagnostics: &mut Diagnostics,
 ) {
     let mut files = Vec::new();
@@ -339,7 +362,8 @@ fn scan_collection(
         }
 
         sources.insert(operation.id.clone(), file.clone());
-        operations.insert(operation.id.clone(), operation);
+        operations.insert(operation.id.clone(), operation.clone());
+        operation_files.insert(operation.id, file);
     }
 }
 

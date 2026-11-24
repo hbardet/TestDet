@@ -51,6 +51,7 @@ fn config_with(
         users,
         secrets: SecretsDeclaration::default(),
         default_login,
+        operation_files: BTreeMap::new(),
     }
 }
 
@@ -245,7 +246,6 @@ environments:
         root.path(),
         "testdet/users.yaml",
         r#"
-defaultLogin: login
 users:
   admin:
     credentials:
