@@ -7,4 +7,5 @@
 /// The version of the TestDet distribution, read from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod config;
 pub mod diagnostic;
