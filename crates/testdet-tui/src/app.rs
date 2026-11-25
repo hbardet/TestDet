@@ -7,17 +7,23 @@
 //! response viewer builds on.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::widgets::{Block, Paragraph};
 use testdet_core::Event;
 use testdet_core::config::{Config, Resolved};
 use testdet_core::operation::model::Operation;
+use testdet_core::outcome::Outcome;
+use testdet_core::redact::Redactor;
+use testdet_core::serde_json::Value;
 
+use crate::body_view::BodyView;
 use crate::keys;
 use crate::request_pane;
+use crate::response_pane::{self, Tab};
 use crate::tree;
+use crate::var_store::VarStore;
 
 /// What a key press asks the frontend to do.
 ///
@@ -72,6 +78,16 @@ pub struct App {
     pub(crate) events: Vec<Event>,
     /// The last status line, shown in the banner.
     pub(crate) status: Option<String>,
+    /// The last finished outcome, redacted, as the response pane renders it.
+    pub(crate) outcome: Option<Outcome>,
+    /// That outcome's body, already turned into display lines.
+    pub(crate) body: Option<BodyView>,
+    /// Which response tab is showing.
+    pub(crate) tab: Tab,
+    /// Variables the user stored with `s`; in memory, this session only.
+    pub(crate) vars: VarStore,
+    /// The redactor every rendered header, cookie and body passes through.
+    pub(crate) redactor: Arc<Redactor>,
 }
 
 impl App {
@@ -97,6 +113,11 @@ impl App {
             running: None,
             events: Vec::new(),
             status: None,
+            outcome: None,
+            body: None,
+            tab: Tab::Body,
+            vars: VarStore::new(),
+            redactor: Arc::new(Redactor::new()),
         }
     }
 
@@ -107,6 +128,16 @@ impl App {
     #[must_use]
     pub fn with_user(mut self, user: Option<String>) -> Self {
         self.user = user;
+        self
+    }
+
+    /// Share the caller's redactor instead of an empty one.
+    ///
+    /// The TUI itself never builds a redactor (that would read secrets), so the
+    /// host — which already has one for the runs it dispatches — passes it in.
+    #[must_use]
+    pub fn with_redactor(mut self, redactor: Arc<Redactor>) -> Self {
+        self.redactor = redactor;
         self
     }
 
@@ -124,9 +155,7 @@ impl App {
         let [request, response] =
             Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(right);
         request_pane::draw(self, frame, request);
-        // Task 21 fills this pane; until then it is explicitly reserved.
-        let block = Block::bordered().title("response");
-        frame.render_widget(Paragraph::new("no response yet").block(block), response);
+        response_pane::draw(self, frame, response);
     }
 
     /// Feed one engine event into the app.
@@ -152,9 +181,32 @@ impl App {
             Event::Finished { outcome } => {
                 self.running = None;
                 self.status = Some(format!("{}: HTTP {}", outcome.operation, outcome.status));
+                let mut body = body_of(outcome);
+                body.set_filter(Some(&self.filter));
+                self.body = Some(body);
+                self.outcome = Some(outcome.clone());
+                self.tab = Tab::Body;
             }
         }
         self.events.push(event);
+    }
+
+    /// Apply the config the host re-resolved for the new environment (C2).
+    ///
+    /// The response pane is cleared: an outcome, its cookies and its
+    /// variables all belong to the environment they came from, so showing them
+    /// under the new banner would be a lie.
+    pub fn apply_resolved(&mut self, resolved: Resolved) {
+        self.env = resolved.env_name.clone();
+        self.resolved = resolved;
+        self.outcome = None;
+        self.body = None;
+        self.status = Some(format!("environment: {}", self.env));
+    }
+
+    /// Put a host message (e.g. a failed environment switch) in the banner.
+    pub fn report(&mut self, message: impl Into<String>) {
+        self.status = Some(message.into());
     }
 
     /// The operation id the cursor is on.
@@ -199,14 +251,127 @@ impl App {
         self.status.as_deref()
     }
 
-    /// Every event received so far (Task 21's input).
+    /// Every event received so far.
     #[must_use]
     pub fn events(&self) -> &[Event] {
         &self.events
     }
 
+    /// The last finished outcome, if any.
+    #[must_use]
+    pub fn outcome(&self) -> Option<&Outcome> {
+        self.outcome.as_ref()
+    }
+
+    /// The last finished body, already prepared for display.
+    #[must_use]
+    pub fn body(&self) -> Option<&BodyView> {
+        self.body.as_ref()
+    }
+
+    /// The operation a run is waiting on, once one was started.
+    #[must_use]
+    pub fn running_operation(&self) -> Option<&str> {
+        self.running.as_deref()
+    }
+
+    /// Variables stored with `s` in this session.
+    #[must_use]
+    pub fn vars(&self) -> &VarStore {
+        &self.vars
+    }
+
+    /// The variable map a run of `operation` would use: the resolved stack
+    /// (operation → env → user → `--var`) with the stored values layered on
+    /// top, so a stored value always wins (§7.19).
+    #[must_use]
+    pub fn vars_for(&self, operation: &str) -> BTreeMap<String, Value> {
+        let mut vars = self
+            .config
+            .operations
+            .get(operation)
+            .map_or_else(BTreeMap::new, |operation| {
+                self.resolved.vars_for(operation, self.user.as_deref())
+            });
+        vars.extend(self.vars.as_overrides());
+        vars
+    }
+
     pub(crate) fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub(crate) fn tab(&self) -> Tab {
+        self.tab
+    }
+
+    /// Scrub one rendered value. Used for every header and cookie value the
+    /// pane prints: the engine already redacted the outcome, and redacting
+    /// again is idempotent, so a value can never slip through raw.
+    pub(crate) fn scrub(&self, value: &str) -> String {
+        self.redactor.scrub(value)
+    }
+
+    /// Flip the body between expanded and collapsed.
+    pub(crate) fn toggle_collapse(&mut self) {
+        if let Some(body) = &mut self.body {
+            body.toggle_collapsed();
+        }
+    }
+
+    /// Show the next response tab.
+    pub(crate) fn next_tab(&mut self) {
+        self.tab = self.tab.next();
+    }
+
+    /// Show the previous response tab.
+    pub(crate) fn previous_tab(&mut self) {
+        self.tab = self.tab.previous();
+    }
+
+    /// Store the last response's fields as variables (`s`).
+    ///
+    /// A GraphQL `data` object is unwrapped first — `{"data":{"token":"…"}}`
+    /// stores `token`, not `data`. Anything that is not a JSON object is stored
+    /// whole under `response`. Values are stored already redacted: they came
+    /// out of the outcome.
+    pub(crate) fn store_selection(&mut self) {
+        let Some(outcome) = &self.outcome else {
+            self.status = Some("nothing to store: no response yet".to_string());
+            return;
+        };
+        let Some(body) = &outcome.body else {
+            self.status = Some("nothing to store: the body was not retained".to_string());
+            return;
+        };
+        let Ok(value) = testdet_core::serde_json::from_slice::<Value>(body) else {
+            self.status = Some("nothing to store: the response is not JSON".to_string());
+            return;
+        };
+        let operation = outcome.operation.clone();
+        let source = format!("{operation} response");
+        let payload = match &value {
+            Value::Object(map) => map.get("data").filter(|data| data.is_object()),
+            _ => None,
+        };
+        let mut stored = 0;
+        match payload.unwrap_or(&value) {
+            Value::Object(map) => {
+                for (name, value) in map {
+                    self.vars.store(name, value.clone(), source.clone());
+                    stored += 1;
+                }
+            }
+            other => {
+                self.vars.store("response", other.clone(), source);
+                stored = 1;
+            }
+        }
+        self.status = Some(if stored == 0 {
+            "nothing stored: the response has no fields".to_string()
+        } else {
+            format!("stored {stored} variable(s) from {operation}")
+        });
     }
 
     pub(crate) fn resolved(&self) -> &Resolved {
@@ -287,13 +452,16 @@ impl App {
         next.unwrap_or_default()
     }
 
-    /// Cycle to the next environment the manifest declares.
-    pub(crate) fn cycle_env(&mut self) -> String {
+    /// The next environment the manifest declares.
+    ///
+    /// The name is only *proposed*: switching needs the config re-resolved
+    /// (and the environment's secrets reloaded), which the host does. The
+    /// banner changes when [`App::apply_resolved`] succeeds, so an unknown
+    /// environment never leaves the UI claiming to be somewhere it is not.
+    pub(crate) fn next_env(&self) -> String {
         let names = self.environments();
         let current = names.iter().position(|name| *name == self.env).unwrap_or(0);
-        let next = names[(current + 1) % names.len()].clone();
-        self.env = next.clone();
-        next
+        names[(current + 1) % names.len()].clone()
     }
 
     /// The selectable environments: the declared ones, plus a synthetic
@@ -332,6 +500,24 @@ impl App {
         self.selected = previous
             .and_then(|id| self.visible.iter().position(|visible| *visible == id))
             .unwrap_or(0);
+        if let Some(body) = &mut self.body {
+            body.set_filter(Some(&self.filter));
+        }
+    }
+}
+
+/// Turn a finished outcome into a [`BodyView`], keeping the distinction between
+/// "empty", "not retained" and "not UTF-8" (§7.16).
+fn body_of(outcome: &Outcome) -> BodyView {
+    let content_type = outcome
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.as_str());
+    match (&outcome.body, outcome.body_retained) {
+        (Some(bytes), _) => BodyView::from_bytes(bytes, content_type),
+        (None, false) => BodyView::not_retained(outcome.body_size),
+        (None, true) => BodyView::from_bytes(&[], content_type),
     }
 }
 

@@ -5,6 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
+use testdet_core::config::Resolved;
 use testdet_core::operation::model::Request;
 
 use crate::app::App;
@@ -33,6 +34,7 @@ pub(crate) fn draw(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 .clone()
                 .unwrap_or_else(|| app.resolved().graphql_path.clone());
             lines.push(Line::from(format!("POST {path}")));
+            lines.push(url_line(app.resolved(), &path));
             lines.push(Line::from(""));
             for query_line in graphql.query.trim().lines() {
                 lines.push(Line::from(format!("  {query_line}")));
@@ -48,6 +50,7 @@ pub(crate) fn draw(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 http.method.to_uppercase(),
                 http.path
             )));
+            lines.push(url_line(app.resolved(), &http.path));
         }
     }
 
@@ -78,5 +81,20 @@ fn masked_header<'a>(name: &'a str) -> Line<'a> {
     Line::from(vec![
         Span::styled(format!("  {name}: "), Style::default().fg(Color::DarkGray)),
         Span::raw(format!("{name}-CENSORED")),
+    ])
+}
+
+/// The absolute URL the operation resolves to for the current environment.
+///
+/// This is what makes `e` visible: the banner names the environment, and this
+/// line shows the host it actually means.
+fn url_line(resolved: &Resolved, path: &str) -> Line<'static> {
+    let url = resolved.url_for(path).map_or_else(
+        |_| format!("cannot resolve `{path}` against {}", resolved.base_url),
+        |url| url.to_string(),
+    );
+    Line::from(vec![
+        Span::styled("url: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(url),
     ])
 }

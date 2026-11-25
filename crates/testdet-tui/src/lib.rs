@@ -8,11 +8,14 @@
 //! and reqwest.
 
 mod app;
+mod body_view;
 mod keys;
 mod request_pane;
+mod response_pane;
 #[cfg(test)]
 mod test_support;
 mod tree;
+mod var_store;
 
 use std::error::Error;
 use std::fmt;
@@ -27,8 +30,11 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use testdet_core::Event;
+use testdet_core::config::Resolved;
 
 pub use crate::app::{Action, App};
+pub use crate::body_view::BodyView;
+pub use crate::var_store::{Stored, VarStore};
 
 /// How long the loop waits for a key before draining the driver's events.
 const POLL: Duration = Duration::from_millis(50);
@@ -43,6 +49,16 @@ pub trait Driver {
     fn start(&mut self, operation: &str, user: Option<&str>);
     /// Cancel the in-flight run, if any.
     fn cancel(&mut self);
+    /// Re-resolve `environment` and make the driver's own state match it.
+    ///
+    /// Returns the newly resolved config so the UI can render the new banner
+    /// and URLs, or the rendered diagnostics to show in the banner when the
+    /// environment does not exist (never a panic).
+    ///
+    /// A driver is expected to rebuild its session store here: cookies belong
+    /// to an environment, so carrying one environment's sessions into another
+    /// would send the wrong identity (§7.7, §7.16).
+    fn switch_environment(&mut self, environment: &str) -> Result<Resolved, String>;
     /// Take every event received since the last call, without blocking.
     fn events(&mut self) -> Vec<Event>;
 }
@@ -149,19 +165,21 @@ fn event_loop(
 
 /// Apply one action to the driver. Returns `false` when the UI should stop.
 ///
-/// Kept separate from the terminal so it can be tested with a fake driver.
-fn dispatch(app: &App, action: Action, driver: &mut dyn Driver) -> Result<bool, TuiError> {
+/// Kept separate from the terminal — and public — so a host or a test can
+/// drive the same dispatch the event loop uses, with a fake
+/// [`Driver`].
+pub fn dispatch(app: &mut App, action: Action, driver: &mut dyn Driver) -> Result<bool, TuiError> {
     match action {
         Action::Quit => return Ok(false),
         Action::Run(operation) => driver.start(&operation, app.user()),
         Action::Cancel => driver.cancel(),
-        // Switching environment needs the config re-resolved, which only the
-        // host can do; the CLI reads `app.environment()` between frames.
-        Action::None
-        | Action::SwitchUser(_)
-        | Action::SwitchEnv(_)
-        | Action::StoreVar
-        | Action::Filter(_) => {}
+        // The host owns config resolution, so it owns the switch: it re-loads
+        // the environment's config, resolves it, and hands the result back.
+        Action::SwitchEnv(environment) => match driver.switch_environment(&environment) {
+            Ok(resolved) => app.apply_resolved(resolved),
+            Err(message) => app.report(message),
+        },
+        Action::None | Action::SwitchUser(_) | Action::StoreVar | Action::Filter(_) => {}
     }
     Ok(true)
 }
@@ -187,6 +205,10 @@ mod tests {
             self.cancelled += 1;
         }
 
+        fn switch_environment(&mut self, environment: &str) -> Result<Resolved, String> {
+            Err(format!("unknown environment `{environment}`"))
+        }
+
         fn events(&mut self) -> Vec<Event> {
             std::mem::take(&mut self.pending)
         }
@@ -195,12 +217,19 @@ mod tests {
     #[test]
     fn dispatch_forwards_run_and_cancel_but_stops_on_quit() {
         let fixture = crate::test_support::fixture_env("dispatch");
-        let app = fixture_app(fixture.root());
+        let mut app = fixture_app(fixture.root());
         let mut driver = FakeDriver::default();
 
-        assert!(dispatch(&app, Action::Run("listProducts".to_string()), &mut driver).unwrap());
-        assert!(dispatch(&app, Action::Cancel, &mut driver).unwrap());
-        assert!(!dispatch(&app, Action::Quit, &mut driver).unwrap());
+        assert!(
+            dispatch(
+                &mut app,
+                Action::Run("listProducts".to_string()),
+                &mut driver
+            )
+            .unwrap()
+        );
+        assert!(dispatch(&mut app, Action::Cancel, &mut driver).unwrap());
+        assert!(!dispatch(&mut app, Action::Quit, &mut driver).unwrap());
 
         assert_eq!(driver.started, vec![("listProducts".to_string(), None)]);
         assert_eq!(driver.cancelled, 1);

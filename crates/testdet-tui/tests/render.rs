@@ -282,7 +282,7 @@ fn q_quits_and_esc_returns_cancel_while_running() {
 
 #[test]
 fn u_cycles_users_and_e_cycles_environments() {
-    let (_sandbox, mut app) = fixture();
+    let (sandbox, mut app) = fixture();
 
     assert_eq!(
         press(&mut app, KeyCode::Char('u')),
@@ -301,6 +301,18 @@ fn u_cycles_users_and_e_cycles_environments() {
         press(&mut app, KeyCode::Char('e')),
         Action::SwitchEnv("production".into())
     );
+    // `e` only proposes the next name: the switch is the host's job (it has to
+    // re-resolve the config), so the banner does not move until the result is
+    // applied — and an unknown environment therefore never moves it at all.
+    assert_eq!(app.environment(), "staging");
+    let production = load_config(&LoadOptions {
+        config: Some(sandbox.manifest()),
+        cwd: sandbox.root.clone(),
+        env: Some("production".to_string()),
+    })
+    .and_then(|config| resolve(&config, Some("production"), &[]))
+    .expect("production resolves");
+    app.apply_resolved(production);
     assert_eq!(
         press(&mut app, KeyCode::Char('e')),
         Action::SwitchEnv("staging".into())
@@ -308,8 +320,8 @@ fn u_cycles_users_and_e_cycles_environments() {
 
     let text = render(&app);
     assert!(
-        text.contains("staging"),
-        "the banner names the environment:\n{text}"
+        text.contains("demo · production"),
+        "the banner names the applied environment:\n{text}"
     );
     assert!(
         text.contains("anonymous"),

@@ -75,6 +75,19 @@ impl RunContext {
         self
     }
 
+    /// Replace the cancellation token with a fresh one and return it.
+    ///
+    /// A cancelled [`CancellationToken`] stays cancelled forever, so a
+    /// frontend that cancels one run and wants to accept the next has two
+    /// options: build a new context, or re-arm this one. Re-arming keeps the
+    /// rest of the context — and any [`crate::SessionStore`] built over it —
+    /// intact, which is what a TUI needs: `Esc` must cancel the request, not
+    /// log the user out (§7.7, §7.10).
+    pub fn renew_cancellation(&mut self) -> CancellationToken {
+        self.cancel = CancellationToken::new();
+        self.cancel.clone()
+    }
+
     /// Emit an event to the configured sink. A closed (dropped) channel is
     /// silently ignored — a disconnected frontend must never fail a run.
     ///

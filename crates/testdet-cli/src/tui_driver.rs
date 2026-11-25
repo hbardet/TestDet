@@ -8,13 +8,22 @@
 //! cancellation crosses the thread boundary through a shared token — the
 //! worker is inside `block_on` while a run is in flight, where only a `select!`
 //! on that token can stop it.
+//!
+//! Two kinds of state change live here, and they are deliberately different:
+//!
+//! * **cancelling** (§7.10) stops one request and keeps the session: the store
+//!   is reused and only its cancellation token is renewed, so `Esc` does not
+//!   log the user out;
+//! * **switching environment** (§7.16) discards the session: cookies belong to
+//!   an environment, so a new store is the correct outcome there.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 
-use testdet_core::config::Resolved;
+use testdet_core::config::{LoadOptions, Resolved, load_config, resolve};
+use testdet_core::diagnostic::render_text;
 use testdet_core::diagnostic::{Diagnostic, Severity, codes};
-use testdet_core::redact::Redactor;
+use testdet_core::redact::{Redactor, redactor_for};
 use testdet_core::session::{SessionStore, execute_for_user};
 use testdet_core::{Event, EventSink, RunContext};
 use testdet_tui::Driver;
@@ -22,12 +31,20 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
 /// What the UI can ask the worker to do.
-#[derive(Debug)]
+///
+/// No `Debug`: the switch carries a `Redactor`, which deliberately does not
+/// print its patterns.
 enum Command {
     /// Run `operation` as `user` (`None` is anonymous).
     Start {
         operation: String,
         user: Option<String>,
+    },
+    /// Adopt a re-resolved environment and start a fresh session store.
+    Switch {
+        resolved: Arc<Resolved>,
+        redactor: Arc<Redactor>,
+        token: CancellationToken,
     },
 }
 
@@ -38,14 +55,19 @@ pub struct ExecutorDriver {
     pending: Vec<Event>,
     token: Arc<Mutex<CancellationToken>>,
     worker: Option<JoinHandle<()>>,
+    /// How to load the config again when the environment changes.
+    loader: LoadOptions,
 }
 
 impl ExecutorDriver {
     /// Spawn the worker.
     ///
-    /// The worker builds its own [`RunContext`], so a cancelled token can be
-    /// replaced without rebuilding the driver.
+    /// `loader` is kept so [`Driver::switch_environment`] can re-load the
+    /// config for another environment (including that environment's secrets
+    /// file); the worker builds its own [`RunContext`], so a cancelled token
+    /// can be replaced without rebuilding the driver.
     pub fn spawn(
+        loader: LoadOptions,
         resolved: Arc<Resolved>,
         redactor: Arc<Redactor>,
         user: Option<String>,
@@ -54,21 +76,20 @@ impl ExecutorDriver {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let token = Arc::new(Mutex::new(CancellationToken::new()));
         let seed = Seed {
-            resolved,
-            redactor,
             events: event_tx,
             user,
             token: token.clone(),
         };
         let worker = thread::Builder::new()
             .name("testdet-tui-executor".to_string())
-            .spawn(move || run_worker(seed, command_rx))?;
+            .spawn(move || run_worker(seed, resolved, redactor, command_rx))?;
         Ok(Self {
             commands: Some(command_tx),
             events: event_rx,
             pending: Vec::new(),
             token,
             worker: Some(worker),
+            loader,
         })
     }
 }
@@ -86,8 +107,30 @@ impl Driver for ExecutorDriver {
     fn cancel(&mut self) {
         // Straight through the shared token: the worker is inside `block_on`
         // while a run is in flight and will not read the channel until it
-        // returns.
+        // returns. The token is renewed by the worker afterwards, so the next
+        // request is not born cancelled.
         lock(&self.token).cancel();
+    }
+
+    fn switch_environment(&mut self, environment: &str) -> Result<Resolved, String> {
+        let options = LoadOptions {
+            env: Some(environment.to_string()),
+            ..self.loader.clone()
+        };
+        let config = load_config(&options).map_err(|diagnostics| render_text(&diagnostics))?;
+        let resolved = resolve(&config, Some(environment), &[])
+            .map_err(|diagnostics| render_text(&diagnostics))?;
+        let redactor = Arc::new(redactor_for(&config, &resolved));
+        let token = CancellationToken::new();
+        *lock(&self.token) = token.clone();
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::Switch {
+                resolved: Arc::new(resolved.clone()),
+                redactor,
+                token,
+            });
+        }
+        Ok(resolved)
     }
 
     fn events(&mut self) -> Vec<Event> {
@@ -109,10 +152,9 @@ impl Drop for ExecutorDriver {
     }
 }
 
-/// Everything the worker needs to build a [`RunContext`] again.
+/// The parts of a [`RunContext`] that survive a run, a cancellation and an
+/// environment switch.
 struct Seed {
-    resolved: Arc<Resolved>,
-    redactor: Arc<Redactor>,
     events: EventSink,
     user: Option<String>,
     token: Arc<Mutex<CancellationToken>>,
@@ -120,27 +162,27 @@ struct Seed {
 
 impl Seed {
     /// A context whose cancellation token is shared with the UI.
-    fn context(&self, token: CancellationToken) -> RunContext {
-        let mut ctx = RunContext::new(self.resolved.clone(), self.redactor.clone())
+    fn context(
+        &self,
+        resolved: &Arc<Resolved>,
+        redactor: &Arc<Redactor>,
+        token: CancellationToken,
+    ) -> RunContext {
+        let mut ctx = RunContext::new(resolved.clone(), redactor.clone())
             .with_user(self.user.clone())
             .with_retain_body(true)
             .with_events(Some(self.events.clone()));
         ctx.cancel = token;
         ctx
     }
-
-    /// Replace the shared token with a fresh one and return it.
-    ///
-    /// A cancelled token stays cancelled, and `RunContext` owns its token, so
-    /// re-arming means a new token *and* a new store.
-    fn rearm(&self) -> CancellationToken {
-        let fresh = CancellationToken::new();
-        *lock(&self.token) = fresh.clone();
-        fresh
-    }
 }
 
-fn run_worker(seed: Seed, commands: std::sync::mpsc::Receiver<Command>) {
+fn run_worker(
+    seed: Seed,
+    mut resolved: Arc<Resolved>,
+    mut redactor: Arc<Redactor>,
+    commands: std::sync::mpsc::Receiver<Command>,
+) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -162,17 +204,32 @@ fn run_worker(seed: Seed, commands: std::sync::mpsc::Receiver<Command>) {
         }
     };
 
-    let mut store = SessionStore::new(seed.context(lock(&seed.token).clone()));
+    let mut store =
+        SessionStore::new(seed.context(&resolved, &redactor, lock(&seed.token).clone()));
 
     while let Ok(command) = commands.recv() {
-        let Command::Start { operation, user } = command;
-        let Some(operation) = seed.resolved.operations.get(&operation) else {
-            continue;
-        };
-        runtime.block_on(execute_for_user(&mut store, user.as_deref(), operation));
-        if lock(&seed.token).is_cancelled() {
-            let token = seed.rearm();
-            store = SessionStore::new(seed.context(token));
+        match command {
+            Command::Start { operation, user } => {
+                let Some(operation) = resolved.operations.get(&operation) else {
+                    continue;
+                };
+                runtime.block_on(execute_for_user(&mut store, user.as_deref(), operation));
+                if lock(&seed.token).is_cancelled() {
+                    // C1: re-arm the token in place. Rebuilding the store here
+                    // would drop every cookie and capture the session owns.
+                    let token = store.renew_cancellation();
+                    *lock(&seed.token) = token;
+                }
+            }
+            Command::Switch {
+                resolved: next,
+                redactor: next_redactor,
+                token,
+            } => {
+                resolved = next;
+                redactor = next_redactor;
+                store = SessionStore::new(seed.context(&resolved, &redactor, token));
+            }
         }
     }
 }

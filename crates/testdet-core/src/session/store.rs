@@ -255,6 +255,15 @@ impl SessionStore {
         }
     }
 
+    /// Replace the store's cancellation token with a fresh one and return it.
+    ///
+    /// The sessions are untouched: cookies, captured variables and default
+    /// headers stay, so cancelling one request does not log the user out
+    /// (§7.7, §7.10). See [`RunContext::renew_cancellation`].
+    pub fn renew_cancellation(&mut self) -> tokio_util::sync::CancellationToken {
+        self.ctx.renew_cancellation()
+    }
+
     /// Run `operation` as `user` through that user's session client.
     ///
     /// `retain_body` forces body retention for this call. A `capture:` map

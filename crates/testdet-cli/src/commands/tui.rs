@@ -43,11 +43,13 @@ pub fn run(args: TuiArgs) -> (Exit, String) {
         }
     };
 
-    let config = match load_config(&LoadOptions {
+    let loader = LoadOptions {
         config: args.config,
         cwd,
         env: args.env.clone(),
-    }) {
+    };
+
+    let config = match load_config(&loader) {
         Ok(config) => config,
         Err(diagnostics) => return (Exit::ConfigInvalid, render_text(&diagnostics)),
     };
@@ -66,17 +68,20 @@ pub fn run(args: TuiArgs) -> (Exit, String) {
     let redactor = Arc::new(redactor_for(&config, &resolved));
     let shared = Arc::new(resolved.clone());
 
-    let mut driver = match ExecutorDriver::spawn(shared, redactor, args.user.clone()) {
-        Ok(driver) => driver,
-        Err(error) => {
-            return (
-                Exit::Internal,
-                format!("internal error: could not start the executor: {error}\n"),
-            );
-        }
-    };
+    let mut driver =
+        match ExecutorDriver::spawn(loader, shared, redactor.clone(), args.user.clone()) {
+            Ok(driver) => driver,
+            Err(error) => {
+                return (
+                    Exit::Internal,
+                    format!("internal error: could not start the executor: {error}\n"),
+                );
+            }
+        };
 
-    let app = testdet_tui::App::new(config, resolved).with_user(args.user);
+    let app = testdet_tui::App::new(config, resolved)
+        .with_redactor(redactor)
+        .with_user(args.user);
     match testdet_tui::run(app, &mut driver) {
         Ok(()) => (Exit::Ok, String::new()),
         Err(error) => (Exit::Internal, format!("terminal error: {error}\n")),

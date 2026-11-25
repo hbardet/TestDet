@@ -781,3 +781,101 @@ async fn f12_emitted_events_are_scrubbed_by_the_context() {
         other => panic!("expected Failed, got {other:?}"),
     }
 }
+
+/// Cancelling one run must not log the user out (C1, §7.10).
+///
+/// A cancelled [`tokio_util::sync::CancellationToken`] stays cancelled, so a
+/// frontend that re-arms it has two choices: rebuild the context — dropping the
+/// cookie jar and the captures with it — or renew the token in place.
+/// [`SessionStore::renew_cancellation`] is the second, and this test pins it:
+/// the capture from the first run still authenticates the third.
+#[tokio::test]
+async fn cancelling_a_run_keeps_the_session_and_its_captures() {
+    use testdet_core::outcome::TransportKind;
+    use tokio_util::sync::CancellationToken;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "data": { "login": { "token": "tok-a" } } })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/slow"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/echo"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "data": { "me": { "id": "u_1" } } })),
+        )
+        .mount(&server)
+        .await;
+
+    let resolved = resolved_for(
+        &server.uri(),
+        json!({}),
+        vec![
+            login_op_capturing("login", "/login"),
+            http_op("slow", "/slow"),
+            session_token_op("echo", "/echo"),
+        ],
+        None,
+    );
+
+    // The token has to be reachable from the test, exactly as the driver's
+    // shared token is reachable from the UI thread.
+    let token = CancellationToken::new();
+    let mut context = RunContext::new(resolved, Arc::new(Redactor::new()));
+    context.cancel = token.clone();
+    let mut store = SessionStore::new(context);
+
+    // A: the login captures a token into the session.
+    let login = login_op_capturing("login", "/login");
+    assert_eq!(execute_for_user(&mut store, None, &login).await.status, 200);
+    assert_eq!(
+        store.vars(None).get("token"),
+        Some(&json!("tok-a")),
+        "the login captured a token"
+    );
+
+    // B: cancelled while in flight.
+    token.cancel();
+    let cancelled = execute_for_user(&mut store, None, &http_op("slow", "/slow")).await;
+    assert!(
+        cancelled
+            .transport_error
+            .as_ref()
+            .is_some_and(|error| error.kind == TransportKind::Cancelled),
+        "the slow run was cancelled: {cancelled:?}"
+    );
+
+    // The re-arm keeps the store: same cookie jar, same captures.
+    let fresh = store.renew_cancellation();
+    assert!(!fresh.is_cancelled(), "the renewed token is usable again");
+    assert_eq!(
+        store.vars(None).get("token"),
+        Some(&json!("tok-a")),
+        "the capture survived the cancellation"
+    );
+
+    // C: still authenticated with A's capture.
+    let echo = execute_for_user(&mut store, None, &session_token_op("echo", "/echo")).await;
+    assert_eq!(echo.status, 200);
+    assert_eq!(
+        last_header(&server, "/echo", "authorization")
+            .await
+            .as_deref(),
+        Some("Bearer tok-a"),
+        "the later request still carries the captured token"
+    );
+    assert_eq!(
+        count_to(&server, "/login").await,
+        1,
+        "no re-login happened: the session itself was never dropped"
+    );
+}
