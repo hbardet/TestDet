@@ -1,0 +1,17 @@
+id: projects
+description: List the projects the captured session token can see.
+tags: [projects, smoke]
+request:
+  kind: graphql
+  operationName: Projects
+  query: |
+    query Projects {
+      projects {
+        id
+        name
+      }
+    }
+  headers:
+    Authorization: "Bearer {{session.token}}"
+capture:
+  projectId: data.projects[0].id

@@ -1,0 +1,16 @@
+version: 1
+name: testdet e2e fixture
+# The authority is a reserved `.invalid` name so the committed tree is
+# port-free and can never reach a real service; `tests/e2e.rs` copies the tree
+# into a temp dir and rewrites it to the mock server's `host:port`.
+baseUrl: http://testdet.invalid/
+collections:
+  - collections
+defaultEnvironment: local
+environments:
+  local:
+    secrets:
+      source: dotenv
+      file: secrets/local.yaml
+  staging:
+    baseUrl: https://staging.example.test/
