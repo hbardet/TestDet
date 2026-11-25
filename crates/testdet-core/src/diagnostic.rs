@@ -230,6 +230,9 @@ pub mod codes {
     pub const E_VERSION: &str = "E_VERSION";
     pub const E_DUPLICATE_KEY: &str = "E_DUPLICATE_KEY";
     pub const E_TRANSPORT: &str = "E_TRANSPORT";
+    /// A `capture:` path did not resolve in the JSON response body. The spec
+    /// (§7.7, §7.13) has no dedicated code for this; recorded as a gap.
+    pub const E_UNRESOLVED_CAPTURE: &str = "E_UNRESOLVED_CAPTURE";
     pub const W_UNUSED_VAR: &str = "W_UNUSED_VAR";
     pub const W_UNSET_SECRET: &str = "W_UNSET_SECRET";
     pub const W_MULTI_OPERATION: &str = "W_MULTI_OPERATION";

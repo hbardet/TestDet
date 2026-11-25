@@ -35,6 +35,12 @@ pub struct Resolved {
     pub headers: HeaderMap,
     pub vars: BTreeMap<String, Value>,
     pub users: BTreeMap<String, User>,
+    /// Every operation, by id. Sessions resolve login operations through this
+    /// map (§7.7.3); the engine does not need it otherwise.
+    pub operations: BTreeMap<String, Operation>,
+    /// `defaultLogin` from the users file: the login operation a user without
+    /// a `login:` override falls back to (§7.7).
+    pub default_login: Option<String>,
     pub secrets: SecretsConfig,
     pub timeout: Duration,
     pub retries: u32,
@@ -148,6 +154,8 @@ pub fn resolve(
         headers,
         vars,
         users,
+        operations: config.operations.clone(),
+        default_login: config.default_login.clone(),
         secrets,
         timeout,
         retries,

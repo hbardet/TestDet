@@ -21,13 +21,11 @@ pub mod envelope;
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Url;
-use reqwest::cookie::Jar;
 use reqwest::header::{CONTENT_TYPE, HeaderName, HeaderValue, SET_COOKIE};
 use serde_json::Value;
 
@@ -37,6 +35,7 @@ use crate::events::Event;
 use crate::operation::model::{Body, Operation, Request};
 use crate::outcome::{CookieInfo, Outcome, RequestEcho, Timing, TransportError, TransportKind};
 use crate::secrets::build_source;
+use crate::session::SessionStore;
 use crate::template::Resolver;
 
 use envelope::graphql_body;
@@ -76,15 +75,27 @@ pub struct PreparedRequest {
 /// that helper changes; names are matched case-insensitively and the last
 /// value wins, so no header is ever sent twice.
 pub fn prepare(ctx: &RunContext, operation: &Operation) -> Result<PreparedRequest, Diagnostics> {
+    let session = BTreeMap::new();
+    prepare_with_session(ctx, operation, &session, &[])
+}
+
+/// [`prepare`] with the calling user's captured session variables and
+/// per-session default headers (§7.7). Session headers are inserted at the user
+/// layer: the operation's own headers still win.
+pub(crate) fn prepare_with_session(
+    ctx: &RunContext,
+    operation: &Operation,
+    session: &BTreeMap<String, Value>,
+    session_headers: &[(String, String)],
+) -> Result<PreparedRequest, Diagnostics> {
     let resolved = &ctx.resolved;
     let vars = resolved.vars_for(operation, ctx.user.as_deref());
-    let session = BTreeMap::new();
     // `Resolved::secrets.file` is already joined against the config root, so
     // an empty root leaves it exactly as resolution computed it.
     let env = build_source(&resolved.secrets, Path::new(""));
     let resolver = Resolver {
         vars: &vars,
-        session: &session,
+        session,
         env: env.as_ref(),
         files: &operation.files,
     };
@@ -96,6 +107,7 @@ pub fn prepare(ctx: &RunContext, operation: &Operation) -> Result<PreparedReques
         resolved,
         operation,
         ctx.user.as_deref(),
+        session_headers,
         &mut diagnostics,
     );
 
@@ -119,21 +131,43 @@ pub fn prepare(ctx: &RunContext, operation: &Operation) -> Result<PreparedReques
     })
 }
 
+/// Run one operation in the store's current user context, sending through
+/// that user's session client.
+///
+/// This is the pre-session entry point: it does **not** log in. Use
+/// [`crate::session::execute_for_user`] when the user may need a session
+/// (login, capture, one re-login on auth failure).
+pub async fn execute(store: &mut SessionStore, operation: &Operation) -> Outcome {
+    let user = store.user().map(str::to_string);
+    store.run(user.as_deref(), operation, false).await
+}
+
 /// Run one operation: send it, read the response, decode a GraphQL envelope,
 /// redact, and return the outcome. The `Finished` event is always emitted,
 /// whatever happened before it.
-pub async fn execute(ctx: &mut RunContext, operation: &Operation) -> Outcome {
+///
+/// `client` comes from the caller's [`SessionStore`], so cookies and
+/// connection pools stay with one identity (§7.7.5); `session` carries the
+/// captured `{{session.*}}` values and `session_headers` the session's default
+/// headers (a static token).
+pub(crate) async fn execute_with_session(
+    ctx: &RunContext,
+    operation: &Operation,
+    client: &reqwest::Client,
+    session: &BTreeMap<String, Value>,
+    session_headers: &[(String, String)],
+) -> Outcome {
     ctx.emit(Event::Started {
         operation: operation.id.clone(),
         user: ctx.user.clone(),
     });
 
-    let request = match prepare(ctx, operation) {
+    let request = match prepare_with_session(ctx, operation, session, session_headers) {
         Ok(request) => request,
-        Err(diagnostics) => return template_failure(ctx, operation, &diagnostics),
+        Err(diagnostics) => return failure_outcome(ctx, operation, &diagnostics),
     };
 
-    let mut outcome = send(ctx, request).await;
+    let mut outcome = send(ctx, request, client).await;
     outcome.operation = operation.id.clone();
 
     if matches!(&operation.request, Request::Graphql(_))
@@ -157,12 +191,19 @@ fn prepare_headers(
     resolved: &crate::config::Resolved,
     operation: &Operation,
     user: Option<&str>,
+    session_headers: &[(String, String)],
     diagnostics: &mut Diagnostics,
 ) -> Vec<(String, String)> {
     let mut headers: Vec<(String, String)> = Vec::new();
 
+    let mut session_layer = crate::config::model::HeaderMap::default();
+    for (name, value) in session_headers {
+        session_layer.0.insert(name.clone(), Some(value.clone()));
+    }
+
     let layers = [
         resolved.headers_for(operation, user),
+        session_layer,
         operation.request.headers().clone(),
     ];
     for layer in &layers {
@@ -452,23 +493,11 @@ fn type_name(value: &Value) -> &'static str {
     }
 }
 
-/// Send a prepared request, retrying transport failures at most
-/// `resolved.retries` times, 100 ms apart. A 4xx/5xx response is never retried.
-async fn send(ctx: &RunContext, request: PreparedRequest) -> Outcome {
+/// Send a prepared request through `client`, retrying transport failures at
+/// most `resolved.retries` times, 100 ms apart. A 4xx/5xx response is never
+/// retried.
+async fn send(ctx: &RunContext, request: PreparedRequest, client: &reqwest::Client) -> Outcome {
     let started = Instant::now();
-
-    let client = match client_for(ctx) {
-        Ok(client) => client,
-        Err(message) => {
-            return transport_failure(
-                ctx,
-                &request,
-                TransportKind::Other,
-                message,
-                started.elapsed(),
-            );
-        }
-    };
 
     let mut attempt = 0;
     loop {
@@ -486,7 +515,7 @@ async fn send(ctx: &RunContext, request: PreparedRequest) -> Outcome {
             bytes: request.body.as_ref().map_or(0, |body| body.len() as u64),
         });
 
-        match send_once(ctx, &client, &request, started).await {
+        match send_once(ctx, client, &request, started).await {
             Ok(outcome) => return outcome,
             Err((kind, message)) => {
                 if is_retryable(&kind) && attempt < ctx.resolved.retries {
@@ -498,19 +527,6 @@ async fn send(ctx: &RunContext, request: PreparedRequest) -> Outcome {
             }
         }
     }
-}
-
-/// Build the per-call client: a fresh cookie jar, the configured timeout, no
-/// redirect following (a redirect is a response the caller must see), and a
-/// versioned user agent. A build failure is reported, never unwrapped.
-fn client_for(ctx: &RunContext) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .cookie_provider(Arc::new(Jar::default()))
-        .timeout(ctx.timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(format!("testdet/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|error| error.to_string())
 }
 
 /// One network attempt: build, send, read status/headers/cookies/body.
@@ -728,10 +744,14 @@ fn transport_failure(
     }
 }
 
-/// A template failure: no request is sent, every diagnostic becomes a `Failed`
-/// event, and the outcome carries the rendered text as an `Other` transport
-/// error.
-fn template_failure(ctx: &RunContext, operation: &Operation, diagnostics: &Diagnostics) -> Outcome {
+/// A template or session failure: no request is sent, every diagnostic
+/// becomes a `Failed` event, and the outcome carries the rendered text as an
+/// `Other` transport error.
+pub(crate) fn failure_outcome(
+    ctx: &RunContext,
+    operation: &Operation,
+    diagnostics: &Diagnostics,
+) -> Outcome {
     for diagnostic in diagnostics.iter() {
         ctx.emit(Event::Failed {
             diagnostic: diagnostic.clone(),

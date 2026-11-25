@@ -16,6 +16,7 @@ pub mod operation;
 pub mod outcome;
 pub mod redact;
 pub mod secrets;
+pub mod session;
 pub mod template;
 
 pub use context::RunContext;
@@ -24,3 +25,4 @@ pub use events::{Event, EventSink};
 pub use outcome::{
     CookieInfo, GraphQLError, Outcome, RequestEcho, Timing, TransportError, TransportKind,
 };
+pub use session::{SessionStore, execute_for_user, is_auth_failure, resolve_capture_path};

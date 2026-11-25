@@ -22,6 +22,7 @@ use testdet_core::config::resolve::{Resolved, resolve};
 use testdet_core::engine::{EnvelopeShape, execute, read_envelope};
 use testdet_core::operation::model::{GraphqlRequest, Operation, Request};
 use testdet_core::redact::Redactor;
+use testdet_core::session::SessionStore;
 
 /// A resolved environment pointing at `base_url`, with `retries` transport
 /// retries and one manifest-default header.
@@ -108,8 +109,8 @@ async fn a_500_is_not_retried_by_default() {
         .mount(&server)
         .await;
 
-    let mut ctx = context(resolved(&server.uri(), 0));
-    let outcome = execute(&mut ctx, &bare_graphql_op("broken")).await;
+    let mut store = SessionStore::new(context(resolved(&server.uri(), 0)));
+    let outcome = execute(&mut store, &bare_graphql_op("broken")).await;
 
     assert_eq!(outcome.status, 500);
     assert!(outcome.transport_error.is_none());
@@ -148,8 +149,8 @@ async fn posts_a_graphql_envelope_with_query_variables_and_operation_name() {
         json!({ "n": 7 }),
     );
 
-    let mut ctx = context(resolved(&server.uri(), 0));
-    let outcome = execute(&mut ctx, &operation).await;
+    let mut store = SessionStore::new(context(resolved(&server.uri(), 0)));
+    let outcome = execute(&mut store, &operation).await;
 
     assert_eq!(outcome.status, 200);
     assert!(outcome.transport_error.is_none());
@@ -175,8 +176,8 @@ async fn a_200_with_errors_is_a_successful_outcome_carrying_the_errors() {
         .mount(&server)
         .await;
 
-    let mut ctx = context(resolved(&server.uri(), 0));
-    let outcome = execute(&mut ctx, &bare_graphql_op("errors")).await;
+    let mut store = SessionStore::new(context(resolved(&server.uri(), 0)));
+    let outcome = execute(&mut store, &bare_graphql_op("errors")).await;
 
     assert_eq!(outcome.status, 200);
     assert!(outcome.transport_error.is_none());
@@ -198,8 +199,8 @@ async fn a_200_with_errors_is_a_successful_outcome_carrying_the_errors() {
 
 #[tokio::test]
 async fn a_connection_refusal_is_a_transport_error_with_no_status() {
-    let mut ctx = context(resolved("http://127.0.0.1:1", 0));
-    let outcome = execute(&mut ctx, &bare_graphql_op("refused")).await;
+    let mut store = SessionStore::new(context(resolved("http://127.0.0.1:1", 0)));
+    let outcome = execute(&mut store, &bare_graphql_op("refused")).await;
 
     assert_eq!(outcome.status, 0);
     let error = outcome.transport_error.expect("transport error recorded");
@@ -219,8 +220,8 @@ async fn a_body_that_is_not_json_is_reported_not_panicked() {
         .mount(&server)
         .await;
 
-    let mut ctx = context(resolved(&server.uri(), 0));
-    let outcome = execute(&mut ctx, &bare_graphql_op("binary")).await;
+    let mut store = SessionStore::new(context(resolved(&server.uri(), 0)));
+    let outcome = execute(&mut store, &bare_graphql_op("binary")).await;
 
     assert_eq!(outcome.status, 200);
     assert!(outcome.transport_error.is_none());
@@ -240,8 +241,8 @@ async fn a_graphql_body_that_is_null_or_an_array_degrades_gracefully() {
         .mount(&server)
         .await;
 
-    let mut ctx = context(resolved(&server.uri(), 0));
-    let outcome = execute(&mut ctx, &bare_graphql_op("nullBody")).await;
+    let mut store = SessionStore::new(context(resolved(&server.uri(), 0)));
+    let outcome = execute(&mut store, &bare_graphql_op("nullBody")).await;
 
     assert_eq!(outcome.status, 200);
     assert!(outcome.graphql_errors.is_empty());
@@ -260,8 +261,8 @@ async fn errors_that_is_not_an_array_is_not_a_crash() {
         .mount(&server)
         .await;
 
-    let mut ctx = context(resolved(&server.uri(), 0));
-    let outcome = execute(&mut ctx, &bare_graphql_op("badErrors")).await;
+    let mut store = SessionStore::new(context(resolved(&server.uri(), 0)));
+    let outcome = execute(&mut store, &bare_graphql_op("badErrors")).await;
 
     assert!(outcome.graphql_errors.is_empty());
     assert_eq!(
@@ -300,8 +301,8 @@ async fn the_request_echo_carries_the_final_headers_after_all_merges() {
         json!({ "token": "s3cr3t-token" }),
     );
 
-    let mut ctx = context(resolved(&server.uri(), 0));
-    let outcome = execute(&mut ctx, &operation).await;
+    let mut store = SessionStore::new(context(resolved(&server.uri(), 0)));
+    let outcome = execute(&mut store, &operation).await;
 
     // Default layer survives, operation layer wins over the default layer.
     assert_eq!(header(&outcome, "x-default"), Some("default-value"));
@@ -350,9 +351,10 @@ async fn cancellation_before_send_yields_a_cancelled_outcome_without_touching_th
         .mount(&server)
         .await;
 
-    let mut ctx = context(resolved(&server.uri(), 0));
+    let ctx = context(resolved(&server.uri(), 0));
     ctx.cancel.cancel();
-    let outcome = execute(&mut ctx, &bare_graphql_op("cancelled")).await;
+    let mut store = SessionStore::new(ctx);
+    let outcome = execute(&mut store, &bare_graphql_op("cancelled")).await;
 
     assert_eq!(outcome.status, 0);
     let error = outcome.transport_error.expect("transport error recorded");
