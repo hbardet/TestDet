@@ -2113,6 +2113,8 @@ dependencies = [
  "testdet-cli",
  "testdet-core",
  "testdet-tui",
+ "tokio",
+ "wiremock",
 ]
 
 [[package]]
@@ -2124,6 +2126,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "testdet-core",
+ "tokio",
 ]
 
 [[package]]

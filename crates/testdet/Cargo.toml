@@ -11,3 +11,5 @@ testdet-tui = { path = "../testdet-tui" }
 [dev-dependencies]
 serde_json = "1.0"
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
+wiremock = "0.6"

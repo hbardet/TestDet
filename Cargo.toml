@@ -5,3 +5,8 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+
+# Keep target/ small: line-tables-only debug info, no incremental artefacts.
+[profile.dev]
+debug = 1
+incremental = false

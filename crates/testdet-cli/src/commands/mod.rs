@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod env;
+pub mod run;
 pub mod show;
 pub mod validate;
 

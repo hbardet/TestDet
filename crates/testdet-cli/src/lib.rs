@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{config, env, show, validate};
+use crate::commands::{config, env, run, show, validate};
 use crate::exit::Exit;
 use crate::format::Format;
 
@@ -31,8 +31,8 @@ enum Commands {
     Tui,
     /// Validate the testdet/ config directory.
     Validate(ValidateCli),
-    /// Run a single operation end to end.
-    Run,
+    /// Run operations end to end: one user, sequential, worst exit code.
+    Run(RunCli),
     /// Inspect environment variables.
     Env(EnvCli),
     /// Show the resolved configuration.
@@ -55,6 +55,78 @@ struct ValidateCli {
     /// (`testdet/secrets/<env>.yaml`).
     #[arg(long)]
     env: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct RunCli {
+    /// Operations to run, in the order given.
+    ids: Vec<String>,
+    /// Select every operation listing this tag.
+    #[arg(long)]
+    tag: Option<String>,
+    /// Select every operation in the config (excludes ids and `--tag`).
+    #[arg(long)]
+    all: bool,
+    /// The single user to run as; omit to run anonymously.
+    #[arg(long)]
+    user: Option<String>,
+    /// Environment to resolve; defaults to the manifest `defaultEnvironment`.
+    #[arg(long)]
+    env: Option<String>,
+    /// A template variable override (`--var key=value`), highest precedence.
+    #[arg(long = "var", value_name = "KEY=VALUE", value_parser = parse_var)]
+    vars: Vec<(String, String)>,
+    /// Output format: `text`, `json` (ndjson for 2+ operations) or `ndjson`.
+    #[arg(long, value_enum, default_value = "text")]
+    format: Format,
+    /// Do not retain response bodies (`body` is null, `body_size` is kept).
+    #[arg(long = "no-body")]
+    no_body: bool,
+    /// Request timeout (`30`, `30s` or `500ms`); overrides the config's value.
+    #[arg(long, value_name = "DURATION", value_parser = parse_timeout)]
+    timeout: Option<u64>,
+}
+
+/// Parse a `--timeout` argument into whole seconds.
+///
+/// §7.15 writes the flag as `--timeout 30s`, so the unit suffix is accepted;
+/// a bare number means seconds, and `ms` must land on a whole number of them.
+fn parse_timeout(raw: &str) -> Result<u64, String> {
+    let raw = raw.trim();
+    if let Some(millis) = raw.strip_suffix("ms") {
+        let millis = parse_number(millis)
+            .ok_or_else(|| format!("expected a number of milliseconds, got `{raw}`"))?;
+        let seconds = millis / 1000;
+        return if seconds == 0 {
+            Err(format!("`{raw}` is shorter than one second"))
+        } else {
+            Ok(seconds)
+        };
+    }
+    let number = raw.strip_suffix('s').unwrap_or(raw);
+    parse_number(number).ok_or_else(|| format!("expected a duration such as `30s`, got `{raw}`"))
+}
+
+/// Parse a non-negative integer, rejecting an empty string.
+fn parse_number(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        None
+    } else {
+        raw.parse::<u64>().ok()
+    }
+}
+
+/// Parse a `--var key=value` argument.
+fn parse_var(raw: &str) -> Result<(String, String), String> {
+    match raw.split_once('=') {
+        Some((key, value)) if !key.trim().is_empty() => {
+            Ok((key.trim().to_string(), value.to_string()))
+        }
+        _ => Err(format!(
+            "expected `key=value` with a non-empty key, got `{raw}`"
+        )),
+    }
 }
 
 #[derive(clap::Args)]
@@ -159,7 +231,30 @@ pub fn run(argv: Vec<OsString>) -> u8 {
             // diagnostics and usage errors go to stderr.
             emit(exit, &output, format == Format::Json && exit == Exit::Ok)
         }
-        Commands::Tui | Commands::Run | Commands::Schema => {
+        Commands::Run(args) => {
+            let format = args.format;
+            let (exit, output) = run::run(run::RunArgs {
+                ids: args.ids,
+                tag: args.tag,
+                all: args.all,
+                user: args.user,
+                env: args.env,
+                vars: args.vars,
+                format,
+                no_body: args.no_body,
+                timeout: args.timeout,
+            });
+            // Outcomes are the machine-readable body (ndjson, or one pretty
+            // object for a single operation under `json`) and belong on
+            // stdout even when an operation failed (exit 2) or the engine
+            // produced an internal outcome (exit 4). Selection, user and
+            // config failures render text diagnostics, which go to stderr.
+            let machine = matches!(format, Format::Json | Format::Ndjson);
+            let rendered_outcomes =
+                matches!(exit, Exit::Ok | Exit::TransportFailure | Exit::Internal);
+            emit(exit, &output, machine && rendered_outcomes)
+        }
+        Commands::Tui | Commands::Schema => {
             eprintln!("not implemented");
             4
         }
@@ -178,4 +273,20 @@ fn emit(exit: Exit, output: &str, to_stdout: bool) -> u8 {
         let _ = stderr.flush();
     }
     exit.code()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_timeout_flag_accepts_seconds_suffixes_and_bare_numbers() {
+        assert_eq!(parse_timeout("30").expect("bare seconds"), 30);
+        assert_eq!(parse_timeout("30s").expect("seconds suffix"), 30);
+        assert_eq!(parse_timeout("1500ms").expect("milliseconds"), 1);
+        assert_eq!(parse_timeout(" 5s ").expect("surrounding space"), 5);
+        assert!(parse_timeout("0ms").is_err());
+        assert!(parse_timeout("soon").is_err());
+        assert!(parse_timeout("").is_err());
+    }
 }
