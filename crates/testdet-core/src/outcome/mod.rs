@@ -60,6 +60,17 @@ impl Outcome {
         for cookie in &mut self.cookies {
             cookie.value = redactor.scrub(&cookie.value);
         }
+        // A transport error's message embeds the request URL (and thus any
+        // secret in a query string); GraphQL errors are echoed server text.
+        if let Some(error) = &mut self.transport_error {
+            error.message = redactor.scrub(&error.message);
+        }
+        for error in &mut self.graphql_errors {
+            error.message = redactor.scrub(&error.message);
+            if let Some(extensions) = &mut error.extensions {
+                redactor.scrub_json(extensions);
+            }
+        }
 
         if let Some(body) = &self.body
             && let Ok(text) = std::str::from_utf8(body)
