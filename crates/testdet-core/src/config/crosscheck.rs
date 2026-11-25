@@ -261,8 +261,8 @@ fn check_per_user_logins(config: &Config, out: &mut Diagnostics) {
     }
 }
 
-/// Validate one `{{session.x}}` reference against the union of every user's
-/// login, allowing it when *any* user's login satisfies it.
+/// Validate one `{{session.x}}` reference against every operation's captures
+/// and every user's login, allowing it when *any* of them satisfies it.
 fn check_session(
     reference: &Reference,
     owner: &str,
@@ -291,23 +291,6 @@ fn check_session(
         }
     }
 
-    // Nothing known at all → a session reference cannot be validated.
-    if login_users.is_empty() {
-        out.push(Diagnostic {
-            code: codes::E_UNKNOWN_VAR,
-            severity: Severity::Error,
-            file: file.clone(),
-            span: *span,
-            path: Some(path.to_string()),
-            message: format!(
-                "`{raw}` in `{owner}` references a session that no login provides",
-                raw = reference.raw
-            ),
-            hint: Some("declare a users file with a login operation first".to_string()),
-        });
-        return;
-    }
-
     // During login (owner is itself a login operation), a session name is
     // legal when it names a credential of any user that logs in through it.
     if let Some(user_names) = login_users.get(owner) {
@@ -320,37 +303,49 @@ fn check_session(
         }
     }
 
-    // Otherwise the name must be captured by some login operation.
-    for login in login_users.keys() {
-        if login == owner {
-            continue;
-        }
-        if config
-            .operations
-            .get(login)
-            .is_some_and(|op| op.capture.contains_key(name))
-        {
-            return;
-        }
+    // A captured value is addressable as `{{session.name}}` from any operation
+    // (§7.7). Which operation captures it, and which operation runs first, is
+    // the config author's choice, so the static check must not assume a login
+    // or an ordering; an unresolved name surfaces at run time as
+    // `E_UNRESOLVED_CAPTURE`.
+    let captures: BTreeSet<&str> = config
+        .operations
+        .values()
+        .flat_map(|operation| operation.capture.keys().map(String::as_str))
+        .collect();
+    if captures.contains(name.as_str()) {
+        return;
     }
 
-    let login_list = backticked(login_users.keys());
-    let mut capture_names = BTreeSet::new();
-    for login in login_users.keys() {
-        if let Some(op) = config.operations.get(login) {
-            capture_names.extend(op.capture.keys().cloned());
-        }
-    }
-
-    let hint = if capture_names.is_empty() {
-        "declare it in the login operation's `capture:`".to_string()
-    } else {
-        let list = capture_names
+    let hint = if !captures.is_empty() {
+        let mut names = captures
             .iter()
             .map(|name| format!("`{name}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("captured by {login_list}: {list}")
+            .collect::<Vec<_>>();
+        let truncated = names.len() > 8;
+        names.truncate(8);
+        let mut list = names.join(", ");
+        if truncated {
+            list.push_str(", …");
+        }
+        format!("known captures: {list}")
+    } else if login_users.is_empty() {
+        "declare a users file with a login operation first".to_string()
+    } else {
+        "declare it in an operation's `capture:`".to_string()
+    };
+
+    let login_list = backticked(login_users.keys());
+    let message = if login_users.is_empty() {
+        format!(
+            "`{raw}` in `{owner}` references a session that no operation captures",
+            raw = reference.raw
+        )
+    } else {
+        format!(
+            "`{raw}` in `{owner}` is not captured by any operation (logins: {login_list})",
+            raw = reference.raw
+        )
     };
 
     out.push(Diagnostic {
@@ -359,10 +354,7 @@ fn check_session(
         file: file.clone(),
         span: *span,
         path: Some(path.to_string()),
-        message: format!(
-            "`{raw}` in `{owner}` is not captured by the login operation {login_list}",
-            raw = reference.raw
-        ),
+        message,
         hint: Some(hint),
     });
 }

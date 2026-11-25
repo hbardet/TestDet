@@ -46,8 +46,8 @@ always writes one array to stdout. Warnings alone still exit 0.
 $ testdet validate
 testdet/collections/projects/projects.yaml:15:5
   headers.Authorization
-E_UNKNOWN_VAR  `{{session.tokn}}` in `projects` is not captured by the login operation `login`
-hint: captured by `login`: `projectId`, `token`
+E_UNKNOWN_VAR  `{{session.tokn}}` in `projects` is not captured by any operation (logins: `login`)
+hint: known captures: `projectId`, `token`
 ```
 
 ## run

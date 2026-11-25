@@ -373,3 +373,131 @@ fn malformed_templates_are_reported_by_validate() {
         hits.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn a_session_reference_may_name_a_capture_from_any_operation() {
+    let root = TempDir::new().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        "version: 1\nname: my-api\ncollections: [users]\n",
+    );
+    write(
+        root.path(),
+        "testdet/users.yaml",
+        "defaultLogin: login\nusers:\n  alice:\n    credentials:\n      email: alice@example.com\n      password: hunter2\n",
+    );
+    write(
+        root.path(),
+        "testdet/users/login.yaml",
+        "id: login\nrequest:\n  kind: http\n  method: POST\n  path: /login\ncapture:\n  token: data.login.token\n",
+    );
+    write(
+        root.path(),
+        "testdet/users/projects.yaml",
+        "id: projects\nrequest:\n  kind: http\n  method: GET\n  path: /projects\n  headers:\n    Authorization: \"Bearer {{session.token}}\"\ncapture:\n  projectId: data.projects[0].id\n",
+    );
+    write(
+        root.path(),
+        "testdet/users/detail.yaml",
+        "id: detail\nrequest:\n  kind: http\n  method: GET\n  path: /projects/{{session.projectId}}\n  headers:\n    Authorization: \"Bearer {{session.token}}\"\n",
+    );
+
+    // A capture from a non-login operation is addressable as `{{session.*}}`
+    // from any later operation; run-time ordering is the author's choice.
+    let config = load_config(&from_cwd(root.path())).expect("the chain validates clean");
+    assert!(config.operations.contains_key("detail"));
+}
+
+#[test]
+fn an_unknown_session_name_errors_with_the_known_capture_names() {
+    let root = TempDir::new().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        "version: 1\nname: my-api\ncollections: [users]\n",
+    );
+    write(
+        root.path(),
+        "testdet/users.yaml",
+        "defaultLogin: login\nusers:\n  alice:\n    credentials:\n      email: alice@example.com\n      password: hunter2\n",
+    );
+    write(
+        root.path(),
+        "testdet/users/login.yaml",
+        "id: login\nrequest:\n  kind: http\n  method: POST\n  path: /login\ncapture:\n  token: data.login.token\n",
+    );
+    write(
+        root.path(),
+        "testdet/users/projects.yaml",
+        "id: projects\nrequest:\n  kind: http\n  method: GET\n  path: /projects\ncapture:\n  projectId: data.projects[0].id\n",
+    );
+    write(
+        root.path(),
+        "testdet/users/detail.yaml",
+        "id: detail\nrequest:\n  kind: http\n  method: GET\n  path: /projects/{{session.nope}}\n",
+    );
+
+    let diagnostics = load_config(&from_cwd(root.path())).unwrap_err();
+    let hits: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.code == codes::E_UNKNOWN_VAR)
+        .collect();
+
+    assert_eq!(hits.len(), 1, "exactly one unknown session name");
+    let diagnostic = hits[0];
+    assert_eq!(diagnostic.path.as_deref(), Some("path"));
+    assert!(
+        diagnostic
+            .hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("`projectId`") && hint.contains("`token`")),
+        "hint lists the known captures, got: {:?}",
+        diagnostic.hint
+    );
+}
+
+#[test]
+fn the_unknown_session_hint_truncates_to_eight_capture_names() {
+    let root = TempDir::new().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        "version: 1\nname: my-api\ncollections: [users]\n",
+    );
+    let mut capture = String::new();
+    for index in 0..10 {
+        capture.push_str(&format!("  key{index}: data.key{index}\n"));
+    }
+    write(
+        root.path(),
+        "testdet/users/capturer.yaml",
+        &format!(
+            "id: capturer\nrequest:\n  kind: http\n  method: GET\n  path: /capture\ncapture:\n{capture}"
+        ),
+    );
+    write(
+        root.path(),
+        "testdet/users/reader.yaml",
+        "id: reader\nrequest:\n  kind: http\n  method: GET\n  path: /r/{{session.nope}}\n",
+    );
+
+    let diagnostics = load_config(&from_cwd(root.path())).unwrap_err();
+    let hits: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.code == codes::E_UNKNOWN_VAR)
+        .collect();
+
+    assert_eq!(hits.len(), 1, "exactly one unknown session name");
+    let hint = hits[0].hint.as_deref().unwrap_or_default();
+    assert!(
+        hint.contains("`key0`"),
+        "hint starts at the first name: {hint:?}"
+    );
+    assert!(hint.contains("`key7`"), "hint lists eight names: {hint:?}");
+    assert!(!hint.contains("`key8`"), "the ninth name is cut: {hint:?}");
+    assert!(
+        hint.ends_with(", …"),
+        "an elided list ends with `, …`: {hint:?}"
+    );
+}

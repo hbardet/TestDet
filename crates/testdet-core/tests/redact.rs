@@ -104,3 +104,39 @@ fn f13_short_values_are_registered_exactly() {
     );
     assert_eq!(redactor.scrub(""), "");
 }
+
+#[test]
+fn f15_short_values_are_censored_only_as_whole_tokens() {
+    let redactor = Redactor::new();
+    redactor.register("CAPTURE_TT", "tt"); // 2 bytes
+    redactor.register("CAPTURE_AB", "ab"); // 2 bytes
+
+    // A 1–3 byte value is only a secret where it stands as a whole token:
+    // `tt` inside `http` and `ab` inside `about` are unrelated output.
+    assert_eq!(
+        redactor.scrub("http://example.test/about"),
+        "http://example.test/about"
+    );
+
+    // Where the value is bounded by non-token characters, it is censored.
+    assert_eq!(redactor.scrub("x-t: ab"), "x-t: <CAPTURE_AB>-CENSORED");
+    assert_eq!(redactor.scrub("?p=tt&"), "?p=<CAPTURE_TT>-CENSORED&");
+}
+
+#[test]
+fn f15_a_three_byte_secret_inside_a_parameter_is_still_censored() {
+    let redactor = Redactor::new();
+    redactor.register("SHORT", "abc"); // 3 bytes: whole-token replacement
+
+    assert_eq!(redactor.scrub("pw=abc;&"), "pw=<SHORT>-CENSORED;&");
+    // Still whole-token only: `abc` inside a longer token is untouched.
+    assert_eq!(redactor.scrub("x-abcd-y"), "x-abcd-y");
+}
+
+#[test]
+fn f15_a_longer_secret_is_still_censored_inside_a_token() {
+    let redactor = Redactor::new();
+    redactor.register("LONG", "0123456789"); // 10 bytes: blind substring
+
+    assert_eq!(redactor.scrub("xx0123456789yy"), "xx<LONG>-CENSOREDyy");
+}

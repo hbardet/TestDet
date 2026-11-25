@@ -42,6 +42,18 @@ struct Inner {
 struct Pattern {
     name: String,
     needle: String,
+    /// A needle shorter than the 4-byte registration threshold is replaced
+    /// only where it stands as a whole token (§7.12): a 2-byte capture such as
+    /// `tt` must not rewrite `http`. Longer needles keep blind substring
+    /// replacement.
+    whole_token: bool,
+}
+
+/// Whether `c` can continue a token for the whole-token rule: identifiers and
+/// path segments are `[A-Za-z0-9_-]`, so a short value between two such
+/// characters is part of a longer word, not a secret standing alone.
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 
 impl Redactor {
@@ -57,10 +69,12 @@ impl Redactor {
     /// secret and must not appear on the wire or in a log. Values shorter than
     /// 4 bytes are stored in their exact form only — their percent-encoded and
     /// base64 forms are short enough to occur inside unrelated output, so the
-    /// extra variants would over-censor (§7.12). Three forms are stored for
-    /// longer values — the exact value, its percent-encoded form
-    /// (`NON_ALPHANUMERIC`) and its base64 form (standard alphabet) — plus the
-    /// unpadded base64 variant when the base64 form ends with `=`.
+    /// extra variants would over-censor (§7.12) — and are replaced only where
+    /// they stand as a whole token, so a capture of `tt` leaves `http` alone.
+    /// Three forms are stored for longer values — the exact value, its
+    /// percent-encoded form (`NON_ALPHANUMERIC`) and its base64 form (standard
+    /// alphabet) — plus the unpadded base64 variant when the base64 form ends
+    /// with `=`. Each registered form follows the same rule on its own length.
     pub fn register(&self, name: &str, value: &str) {
         if value.is_empty() {
             return;
@@ -85,9 +99,11 @@ impl Redactor {
             {
                 continue;
             }
+            let whole_token = needle.len() < 4;
             inner.patterns.push(Pattern {
                 name: name.to_string(),
                 needle,
+                whole_token,
             });
         }
     }
@@ -95,10 +111,13 @@ impl Redactor {
     /// Replace every registered secret in `s` with `<NAME>-CENSORED`.
     ///
     /// Patterns are applied longest-first so a value that contains a shorter
-    /// registered value is replaced wholesale. Scrubbing is idempotent: the
-    /// replacement tag contains no registered needle (unless a needle is
-    /// itself a substring of the tag, which registration makes impossible in
-    /// practice).
+    /// registered value is replaced wholesale. A needle shorter than 4 bytes is
+    /// replaced only when it stands as a whole token — bounded on both sides by
+    /// a character outside `[A-Za-z0-9_-]`, or by the string's end — so a
+    /// 2-byte capture censors `x: ab` without erasing `http`. Scrubbing is
+    /// idempotent: the replacement tag contains no registered needle (unless a
+    /// needle is itself a substring of the tag, which registration makes
+    /// impossible in practice).
     #[must_use]
     pub fn scrub(&self, s: &str) -> String {
         let guard = read_lock(&self.0);
@@ -107,7 +126,12 @@ impl Redactor {
 
         let mut out = s.to_string();
         for pattern in patterns {
-            out = out.replace(&pattern.needle, &replacement_tag(&pattern.name));
+            let tag = replacement_tag(&pattern.name);
+            out = if pattern.whole_token {
+                replace_whole_token(&out, &pattern.needle, &tag)
+            } else {
+                out.replace(&pattern.needle, &tag)
+            };
         }
         out
     }
@@ -151,6 +175,38 @@ impl Default for Redactor {
     fn default() -> Self {
         Self(Arc::new(RwLock::new(Inner::default())))
     }
+}
+
+/// Replace `needle` in `haystack` only where it stands as a whole token.
+///
+/// A match is kept when the character before it and the character after it are
+/// either absent (string edges) or outside `[A-Za-z0-9_-]`; a rejected match is
+/// left in place and the scan continues one byte to the right, so overlapping
+/// candidates are still considered.
+fn replace_whole_token(haystack: &str, needle: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(haystack.len());
+    let mut copied = 0;
+    let mut start = 0;
+    while start + needle.len() <= haystack.len() {
+        if haystack.is_char_boundary(start) && haystack[start..].starts_with(needle) {
+            let end = start + needle.len();
+            let before_is_token = haystack[..start]
+                .chars()
+                .next_back()
+                .is_some_and(is_token_char);
+            let after_is_token = haystack[end..].chars().next().is_some_and(is_token_char);
+            if !before_is_token && !after_is_token {
+                out.push_str(&haystack[copied..start]);
+                out.push_str(replacement);
+                copied = end;
+                start = end;
+                continue;
+            }
+        }
+        start += 1;
+    }
+    out.push_str(&haystack[copied..]);
+    out
 }
 
 /// Seed a [`Redactor`] from what the config actually references, not only

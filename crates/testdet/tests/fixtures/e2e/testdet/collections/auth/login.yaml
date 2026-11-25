@@ -21,10 +21,8 @@ request:
   variables:
     email: "{{var.email}}"
     password: "{{env.E2E_PASSWORD}}"
-# `projectId` is captured here as well as in `projects`: the validator accepts a
-# `{{session.name}}` only when a login operation captures it, and `projects`
-# re-captures the id of the project it actually listed before `projects_detail`
-# spends it.
+# `projects` captures the id of the project it actually listed; `projects_detail`
+# spends it. The login response also reports the user's default project, which
+# `tests/e2e.rs` uses to prove the detail path took `projects`' capture.
 capture:
   token: data.login.token
-  projectId: data.login.project.id
