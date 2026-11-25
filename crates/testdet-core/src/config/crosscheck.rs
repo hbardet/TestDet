@@ -33,14 +33,94 @@ pub fn crosscheck(config: &Config) -> Diagnostics {
     check_default_login(config, &mut out);
     check_per_user_logins(config, &mut out);
 
+    for surface in reference_surfaces(config) {
+        check_value_in(
+            &surface.value,
+            &surface.owner,
+            &surface.file,
+            &surface.path_prefix,
+            config,
+            &mut out,
+        );
+    }
+
     for (id, operation) in &config.operations {
-        let surface = scan_surface(operation);
-        check_value(&surface, id, config, &mut out);
-        check_unused_files(id, operation, &surface, config, &mut out);
+        check_unused_files(id, operation, &scan_surface(operation), config, &mut out);
     }
 
     sort(&mut out);
     out
+}
+
+/// The `used_by` owner recorded for a reference made from `users.yaml`.
+///
+/// `required_vars`, crosscheck and the redaction seed all read the same
+/// surface, so they agree on this spelling.
+pub const USERS_SURFACE: &str = "users.yaml";
+
+/// One template-bearing surface of the config: the synthetic JSON document to
+/// scan, the owner named in diagnostics, the file it was declared in and the
+/// document-path prefix for its fields.
+pub(crate) struct ReferenceSurface {
+    /// The diagnostic owner: an operation id, or [`USERS_SURFACE`].
+    pub owner: String,
+    /// The file the surface was declared in, when known.
+    pub file: Option<PathBuf>,
+    /// Prepended to each reference path (`""` for operations,
+    /// `"users.<name>."` for a user entry).
+    pub path_prefix: String,
+    /// The synthetic document scanned for references.
+    pub value: Value,
+}
+
+/// Every template-bearing surface of the config, in a stable order.
+///
+/// This is the single source of truth for "which references does this config
+/// make": the cross-file rules, [`crate::secrets::required_vars`] and the
+/// redaction seed all iterate it, so a secret used only from `users.yaml` can
+/// never be invisible to one of them (§7.11, §7.12).
+pub(crate) fn reference_surfaces(config: &Config) -> Vec<ReferenceSurface> {
+    let mut surfaces = Vec::new();
+
+    for (id, operation) in &config.operations {
+        surfaces.push(ReferenceSurface {
+            owner: id.clone(),
+            file: config.operation_files.get(id).cloned(),
+            path_prefix: String::new(),
+            value: scan_surface(operation),
+        });
+    }
+
+    if !config.users.is_empty() {
+        let users_file = config.root_dir.join(USERS_SURFACE);
+        for (name, user) in &config.users {
+            surfaces.push(ReferenceSurface {
+                owner: USERS_SURFACE.to_string(),
+                file: Some(users_file.clone()),
+                path_prefix: format!("users.{name}."),
+                value: user_surface(user),
+            });
+        }
+    }
+
+    surfaces
+}
+
+/// The template-bearing fields of one user entry, as a JSON object whose keys
+/// are the on-disk names (`token`, `tokenHeader`, `credentials`, `headers`,
+/// `vars`).
+fn user_surface(user: &User) -> Value {
+    let mut doc = serde_json::Map::new();
+    if let Some(Some(token)) = &user.token {
+        doc.insert("token".to_string(), Value::String(token.clone()));
+    }
+    if let Some(Some(header)) = &user.token_header {
+        doc.insert("tokenHeader".to_string(), Value::String(header.clone()));
+    }
+    doc.insert("credentials".to_string(), strings_object(&user.credentials));
+    doc.insert("headers".to_string(), headers_object(&user.headers));
+    doc.insert("vars".to_string(), json_object(&user.vars));
+    Value::Object(doc)
 }
 
 /// Validate every reference found in `value` for the operation named `owner`.
@@ -49,16 +129,30 @@ pub fn crosscheck(config: &Config) -> Diagnostics {
 /// the owner operation in its message. `owner` is the operation id.
 pub fn check_value(value: &Value, owner: &str, config: &Config, out: &mut Diagnostics) {
     let file = config.operation_files.get(owner).cloned();
+    check_value_in(value, owner, &file, "", config, out);
+}
+
+/// The shared body of [`check_value`], with an explicit file and path prefix
+/// so `users.yaml` fields report `users.<name>.<key>` paths.
+fn check_value_in(
+    value: &Value,
+    owner: &str,
+    file: &Option<PathBuf>,
+    path_prefix: &str,
+    config: &Config,
+    out: &mut Diagnostics,
+) {
     for reference in references(value) {
-        check_reference(&reference, owner, &file, config, out);
+        check_reference(&reference, owner, file, path_prefix, config, out);
     }
     for occurrence in malformed(value) {
+        let path = format!("{path_prefix}{}", occurrence.path);
         out.push(Diagnostic {
             code: codes::E_WRONG_TYPE,
             severity: Severity::Error,
             file: file.clone(),
-            span: span_for_reference(config, &file, &occurrence.path),
-            path: Some(occurrence.path.clone()),
+            span: span_for_reference(config, file, &path),
+            path: Some(path),
             message: format!(
                 "malformed template `{raw}` in `{owner}`: {reason}",
                 raw = occurrence.raw,
@@ -74,11 +168,13 @@ fn check_reference(
     reference: &Reference,
     owner: &str,
     file: &Option<PathBuf>,
+    path_prefix: &str,
     config: &Config,
     out: &mut Diagnostics,
 ) {
     let operation = config.operations.get(owner);
-    let span = span_for_reference(config, file, &reference.path);
+    let path = format!("{path_prefix}{}", reference.path);
+    let span = span_for_reference(config, file, &path);
     match &reference.token {
         Token::File(name) => {
             let declared = operation.is_some_and(|op| op.files.contains_key(name));
@@ -88,7 +184,7 @@ fn check_reference(
                     severity: Severity::Error,
                     file: file.clone(),
                     span,
-                    path: Some(reference.path.clone()),
+                    path: Some(path),
                     message: format!("file `{name}` is referenced but not declared in `{owner}`"),
                     hint: Some(file_names_hint(operation)),
                 });
@@ -108,13 +204,15 @@ fn check_reference(
                     severity: Severity::Error,
                     file: file.clone(),
                     span,
-                    path: Some(reference.path.clone()),
+                    path: Some(path),
                     message: format!("secret `{name}` is not declared in `{owner}`"),
                     hint: Some(secrets_file_hint(name, config)),
                 });
             }
         }
-        Token::Session(name) => check_session(name, owner, file, config, out, reference, &span),
+        Token::Session(_name) => {
+            check_session(reference, owner, file, config, out, &path, &span);
+        }
         Token::Var(_) => {
             // `var` resolution is a within-config concern (operation/env/user
             // layers), owned by Task 10 and the runtime — not cross-file.
@@ -166,14 +264,17 @@ fn check_per_user_logins(config: &Config, out: &mut Diagnostics) {
 /// Validate one `{{session.x}}` reference against the union of every user's
 /// login, allowing it when *any* user's login satisfies it.
 fn check_session(
-    name: &str,
+    reference: &Reference,
     owner: &str,
     file: &Option<PathBuf>,
     config: &Config,
     out: &mut Diagnostics,
-    reference: &Reference,
+    path: &str,
     span: &Option<Span>,
 ) {
+    let Token::Session(name) = &reference.token else {
+        return;
+    };
     // Effective login id per user: `user.login` overrides `defaultLogin`.
     let mut login_users: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (user_name, user) in &config.users {
@@ -197,7 +298,7 @@ fn check_session(
             severity: Severity::Error,
             file: file.clone(),
             span: *span,
-            path: Some(reference.path.clone()),
+            path: Some(path.to_string()),
             message: format!(
                 "`{raw}` in `{owner}` references a session that no login provides",
                 raw = reference.raw
@@ -257,7 +358,7 @@ fn check_session(
         severity: Severity::Error,
         file: file.clone(),
         span: *span,
-        path: Some(reference.path.clone()),
+        path: Some(path.to_string()),
         message: format!(
             "`{raw}` in `{owner}` is not captured by the login operation {login_list}",
             raw = reference.raw

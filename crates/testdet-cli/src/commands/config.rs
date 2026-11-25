@@ -1,11 +1,15 @@
 //! `testdet config` — print the fully resolved configuration (§7.19, §7.12).
 //!
-//! Every string value passes through the [`Redactor`], so a header echo or a
-//! variable that happens to contain a secret is printed as `<NAME>-CENSORED`
-//! rather than leaked.
+//! The view is *resolved*, not a dump of templates: headers and variables go
+//! through the same [`Resolver`] the engine uses, so what is printed is what
+//! would be sent. Every string value then passes through the [`Redactor`], so a
+//! resolved secret is printed as `<NAME>-CENSORED` rather than leaked. A
+//! template that cannot resolve here (a `{{session.*}}` reference, an unset
+//! secret) is kept literally and listed under `unresolved` — never silently
+//! dropped.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use testdet_core::config::model::{HeaderMap, User};
@@ -14,6 +18,7 @@ use testdet_core::diagnostic::render_text as render_diagnostics;
 use testdet_core::operation::model::{HttpRequest, Operation, Request};
 use testdet_core::redact::{Redactor, redactor_for};
 use testdet_core::secrets::{Origin, build_source};
+use testdet_core::template::Resolver;
 
 use crate::exit::Exit;
 use crate::format::Format;
@@ -33,12 +38,12 @@ pub struct ConfigArgs {
 
 /// Run `testdet config`.
 ///
-/// Returns the exit code and the complete rendered output. A successful
-/// [`Format::Json`] render is the only output that belongs on stdout; the
-/// human [`Format::Text`] render, unknown-user usage errors and config-failure
-/// diagnostics all go to stderr, which `testdet-cli::run` handles. A config
-/// that fails to load prints its text diagnostics and exits 1; a usage error
-/// (`--format ndjson`, an unknown `--user`) exits 3.
+/// Returns the exit code and the complete rendered output. Both the [`Format::Json`]
+/// and the human [`Format::Text`] renders are DATA and go to stdout; only the
+/// unknown-user usage error and config-failure diagnostics go to stderr, which
+/// `testdet-cli::run` handles. A config that fails to load prints its text
+/// diagnostics and exits 1; a usage error (`--format ndjson`, an unknown
+/// `--user`) exits 3.
 pub fn run(args: ConfigArgs) -> (Exit, String) {
     if args.format == Format::Ndjson {
         return (Exit::Usage, crate::commands::ndjson_usage_error());
@@ -76,10 +81,11 @@ pub fn run(args: ConfigArgs) -> (Exit, String) {
 
     let redactor = redactor_for(&config, &resolved);
     let user = args.user.as_deref();
+    let view = View::build(&resolved, user);
 
     let output = match args.format {
-        Format::Json => render_json(&config, &resolved, user, &redactor),
-        Format::Text => render_text(&config, &resolved, user, &redactor),
+        Format::Json => render_json(&config, &resolved, &view, &redactor),
+        Format::Text => render_text(&config, &resolved, &view, &redactor),
         Format::Ndjson => unreachable!("handled above"),
     };
 
@@ -105,16 +111,7 @@ fn unknown_user(user: &str, resolved: &Resolved) -> String {
 /// The JSON form (ruling 5): `env`, `baseUrl`, `graphqlPath`, `headers`,
 /// `vars`, `users` (`login`, `token` presence only) and `secrets` (`declared`,
 /// `set`, `origin`). Pretty-printed; every string value is scrubbed.
-fn render_json(
-    config: &Config,
-    resolved: &Resolved,
-    user: Option<&str>,
-    redactor: &Redactor,
-) -> String {
-    let empty = empty_operation();
-    let headers = resolved.headers_for(&empty, user);
-    let vars = resolved.vars_for(&empty, user);
-
+fn render_json(config: &Config, resolved: &Resolved, view: &View, redactor: &Redactor) -> String {
     let mut root = serde_json::Map::new();
     root.insert("env".to_string(), Value::String(resolved.env_name.clone()));
     root.insert(
@@ -125,13 +122,19 @@ fn render_json(
         "graphqlPath".to_string(),
         Value::String(resolved.graphql_path.clone()),
     );
-    root.insert("headers".to_string(), headers_value(&headers));
+    root.insert("headers".to_string(), headers_value(&view.headers));
     root.insert(
         "vars".to_string(),
-        Value::Object(vars.into_iter().collect()),
+        Value::Object(
+            view.vars
+                .iter()
+                .map(|(name, value)| (name.clone(), view_value_json(value)))
+                .collect(),
+        ),
     );
     root.insert("users".to_string(), users_value(&resolved.users));
     root.insert("secrets".to_string(), secrets_value(config, resolved));
+    root.insert("unresolved".to_string(), unresolved_value(&view.unresolved));
 
     let mut root = Value::Object(root);
     redactor.scrub_json(&mut root);
@@ -144,15 +147,7 @@ fn render_json(
 /// The human form (ruling 5): `key: value` lines grouped under
 /// `environment:`, `headers:`, `vars:`, `users:` and `secrets:` with two-space
 /// indentation. Every value passes through the redactor.
-fn render_text(
-    config: &Config,
-    resolved: &Resolved,
-    user: Option<&str>,
-    redactor: &Redactor,
-) -> String {
-    let empty = empty_operation();
-    let headers = resolved.headers_for(&empty, user);
-    let vars = resolved.vars_for(&empty, user);
+fn render_text(config: &Config, resolved: &Resolved, view: &View, redactor: &Redactor) -> String {
     let source = build_source(&resolved.secrets, &config.root_dir);
 
     let mut out = String::new();
@@ -169,17 +164,13 @@ fn render_text(
     ));
 
     out.push_str("headers:\n");
-    for (name, value) in &headers.0 {
-        let rendered = value
-            .as_ref()
-            .map(|v| redactor.scrub(v))
-            .unwrap_or_else(|| "(unset)".to_string());
-        out.push_str(&format!("  {name}: {rendered}\n"));
+    for (name, value) in &view.headers {
+        out.push_str(&format!("  {name}: {}\n", view_text(value, redactor)));
     }
 
     out.push_str("vars:\n");
-    for (name, value) in &vars {
-        out.push_str(&format!("  {name}: {}\n", var_text(value, redactor)));
+    for (name, value) in &view.vars {
+        out.push_str(&format!("  {name}: {}\n", view_text(value, redactor)));
     }
 
     out.push_str("users:\n");
@@ -203,19 +194,194 @@ fn render_text(
         }
     }
 
+    // Never silent: every template the view could not resolve is listed with
+    // the text as written (which is what would be sent if it stayed unresolved).
+    if !view.unresolved.is_empty() {
+        out.push_str("unresolved:\n");
+        for entry in &view.unresolved {
+            out.push_str(&format!(
+                "  {}: {}\n",
+                entry.path,
+                redactor.scrub(&entry.template)
+            ));
+        }
+    }
+
     out
 }
 
-/// The JSON object for a merged [`HeaderMap`]; `None` becomes `null`.
-fn headers_value(headers: &HeaderMap) -> Value {
-    let mut map = serde_json::Map::new();
-    for (name, value) in &headers.0 {
-        map.insert(
-            name.clone(),
-            value
+/// One template the view could not resolve, kept so it can be reported instead
+/// of silently dropped (F7).
+struct Unresolved {
+    /// Where it sits, e.g. `headers.authorization` or `vars.base`.
+    path: String,
+    /// The template exactly as written.
+    template: String,
+    /// The resolver's own message.
+    message: String,
+}
+
+/// One header or variable in the resolved view.
+struct ViewValue {
+    /// The template as written (`None` for an unset header or a non-string
+    /// variable).
+    template: Option<String>,
+    /// The resolved value, or `None` when it could not resolve here.
+    resolved: Option<Value>,
+}
+
+/// The merged header and variable layers, resolved exactly as the engine
+/// resolves them, plus every template that could not resolve (F7).
+struct View {
+    headers: Vec<(String, ViewValue)>,
+    vars: Vec<(String, ViewValue)>,
+    unresolved: Vec<Unresolved>,
+}
+
+impl View {
+    /// Resolve the merged layers with the engine's [`Resolver`].
+    ///
+    /// The session is empty because `config` runs before any login, so a
+    /// `{{session.*}}` reference is expected to fail: it is shown literally and
+    /// reported in `unresolved`. The same is true of an unset `{{env.*}}`.
+    fn build(resolved: &Resolved, user: Option<&str>) -> Self {
+        let empty = empty_operation();
+        let vars = resolved.vars_for(&empty, user);
+        let session = BTreeMap::new();
+        let env = build_source(&resolved.secrets, Path::new(""));
+        let resolver = Resolver {
+            vars: &vars,
+            session: &session,
+            env: env.as_ref(),
+            files: &empty.files,
+        };
+
+        let mut view = Self {
+            headers: Vec::new(),
+            vars: Vec::new(),
+            unresolved: Vec::new(),
+        };
+
+        let headers = resolved.headers_for(&empty, user);
+        for (name, value) in &headers.0 {
+            let template = value.clone();
+            let resolved_value = template
                 .as_ref()
-                .map_or(Value::Null, |v| Value::String(v.clone())),
-        );
+                .and_then(|raw| view.resolve_entry(&resolver, format!("headers.{name}"), raw));
+            view.headers.push((
+                name.clone(),
+                ViewValue {
+                    template,
+                    resolved: resolved_value,
+                },
+            ));
+        }
+
+        for (name, value) in &vars {
+            match value {
+                Value::String(raw) => {
+                    let resolved_value = view.resolve_entry(&resolver, format!("vars.{name}"), raw);
+                    view.vars.push((
+                        name.clone(),
+                        ViewValue {
+                            template: Some(raw.clone()),
+                            resolved: resolved_value,
+                        },
+                    ));
+                }
+                other => view.vars.push((
+                    name.clone(),
+                    ViewValue {
+                        template: None,
+                        resolved: Some(other.clone()),
+                    },
+                )),
+            }
+        }
+
+        view
+    }
+
+    /// Resolve one string, recording a failure instead of propagating it.
+    fn resolve_entry(&mut self, resolver: &Resolver<'_>, path: String, raw: &str) -> Option<Value> {
+        match resolver.resolve_str(raw) {
+            Ok(value) => Some(value),
+            Err(diagnostics) => {
+                let message = diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                self.unresolved.push(Unresolved {
+                    path,
+                    template: raw.to_string(),
+                    message,
+                });
+                None
+            }
+        }
+    }
+}
+
+/// The text form of one view value.
+///
+/// A template stays visible — it is not a secret — with the censored resolved
+/// value beside it, so `{{env.ADMIN_TOKEN}}` prints as
+/// `{{env.ADMIN_TOKEN}} (<NAME>-CENSORED)` instead of leaking the value.
+fn view_text(value: &ViewValue, redactor: &Redactor) -> String {
+    let Some(template) = &value.template else {
+        return match &value.resolved {
+            Some(resolved) => var_text(resolved, redactor),
+            None => "(unset)".to_string(),
+        };
+    };
+    match &value.resolved {
+        Some(resolved) => {
+            let rendered = var_text(resolved, redactor);
+            if template.contains("{{") && rendered != *template {
+                format!("{template} ({rendered})")
+            } else {
+                rendered
+            }
+        }
+        None => format!("{template} (unresolved)"),
+    }
+}
+
+/// The JSON form of one view value: the resolved value, the literal template
+/// when it could not resolve, or `null` for an unset header.
+fn view_value_json(value: &ViewValue) -> Value {
+    match (&value.resolved, &value.template) {
+        (Some(resolved), _) => resolved.clone(),
+        (None, Some(template)) => Value::String(template.clone()),
+        (None, None) => Value::Null,
+    }
+}
+
+/// The JSON array of unresolved templates.
+fn unresolved_value(unresolved: &[Unresolved]) -> Value {
+    Value::Array(
+        unresolved
+            .iter()
+            .map(|entry| {
+                let mut object = serde_json::Map::new();
+                object.insert("path".to_string(), Value::String(entry.path.clone()));
+                object.insert(
+                    "template".to_string(),
+                    Value::String(entry.template.clone()),
+                );
+                object.insert("message".to_string(), Value::String(entry.message.clone()));
+                Value::Object(object)
+            })
+            .collect(),
+    )
+}
+
+/// The JSON object for the resolved header layer; an unset header is `null`.
+fn headers_value(headers: &[(String, ViewValue)]) -> Value {
+    let mut map = serde_json::Map::new();
+    for (name, value) in headers {
+        map.insert(name.clone(), view_value_json(value));
     }
     Value::Object(map)
 }

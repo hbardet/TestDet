@@ -25,11 +25,11 @@ pub struct ValidateArgs {
 
 /// Run `testdet validate`.
 ///
-/// Builds every diagnostic with [`load_diagnostics`] (warnings included) so a
+/// Builds every diagnostic with [`load_with_diagnostics`] (warnings included) so a
 /// warnings-only config prints its warnings and exits 0. A config with at
 /// least one error exits 1. The returned string is the complete rendered
 /// output; `testdet-cli::run` routes it to stdout for [`Format::Json`] and to
-/// stderr otherwise.
+/// stderr otherwise (a validation result is diagnostics, not data).
 pub fn run(args: ValidateArgs) -> (Exit, String) {
     if args.format == Format::Ndjson {
         return (Exit::Usage, crate::commands::ndjson_usage_error());

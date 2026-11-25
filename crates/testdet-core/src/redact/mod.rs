@@ -11,6 +11,7 @@
 //! poisoned lock rather than panicking, and no read guard is held across an
 //! await (there is no async here).
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use base64::Engine;
@@ -18,8 +19,10 @@ use base64::engine::general_purpose::STANDARD;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::Value;
 
+use crate::config::crosscheck::reference_surfaces;
 use crate::config::{Config, Resolved};
 use crate::secrets::build_source;
+use crate::template::{Resolver, Token, references};
 
 /// A live, interior-mutable set of secret patterns.
 ///
@@ -50,24 +53,27 @@ impl Redactor {
 
     /// Register one secret value under `name`.
     ///
-    /// Empty values and values shorter than 4 bytes are ignored: a 1-byte
-    /// "secret" would censor half of any output it appeared in, so the
-    /// threshold trades a vanishingly rare leak for no false positives.
-    ///
-    /// Three forms are stored — the exact value, its percent-encoded form
+    /// Any non-empty value is registered: a 1–3 byte default is still a
+    /// secret and must not appear on the wire or in a log. Values shorter than
+    /// 4 bytes are stored in their exact form only — their percent-encoded and
+    /// base64 forms are short enough to occur inside unrelated output, so the
+    /// extra variants would over-censor (§7.12). Three forms are stored for
+    /// longer values — the exact value, its percent-encoded form
     /// (`NON_ALPHANUMERIC`) and its base64 form (standard alphabet) — plus the
     /// unpadded base64 variant when the base64 form ends with `=`.
     pub fn register(&self, name: &str, value: &str) {
-        if value.is_empty() || value.len() < 4 {
+        if value.is_empty() {
             return;
         }
 
         let mut needles = vec![value.to_string()];
-        needles.push(utf8_percent_encode(value, NON_ALPHANUMERIC).to_string());
-        let encoded = STANDARD.encode(value);
-        needles.push(encoded.clone());
-        if encoded.ends_with('=') {
-            needles.push(encoded.trim_end_matches('=').to_string());
+        if value.len() >= 4 {
+            needles.push(utf8_percent_encode(value, NON_ALPHANUMERIC).to_string());
+            let encoded = STANDARD.encode(value);
+            needles.push(encoded.clone());
+            if encoded.ends_with('=') {
+                needles.push(encoded.trim_end_matches('=').to_string());
+            }
         }
 
         let mut inner = write_lock(&self.0);
@@ -147,8 +153,14 @@ impl Default for Redactor {
     }
 }
 
-/// Seed a [`Redactor`] from a resolved config: every declared secret that
-/// resolves to a value, and every user's set token (as `USER_<user>`).
+/// Seed a [`Redactor`] from what the config actually references, not only
+/// from the declaration file (§7.12).
+///
+/// Three layers, in order: every `{{env.X}}` reached by a template in the
+/// shared reference surface (operations and `users.yaml`), then every declared
+/// name that resolves (parity with the declaration-driven behaviour), then
+/// each user's static `token:` in its *resolved* form, which is the string
+/// that actually goes on the wire.
 ///
 /// Task 18 (`run`) and the TUI call this rather than hand-rolling the
 /// seeding. A `Some(None)` (explicitly unset) or `None` (absent) user token
@@ -158,6 +170,18 @@ pub fn redactor_for(config: &Config, resolved: &Resolved) -> Redactor {
     let redactor = Redactor::new();
     let source = build_source(&resolved.secrets, &config.root_dir);
 
+    // A reference is redacted whether or not it is declared: a shell variable
+    // is a real value either way, and this is the layer that hides it.
+    for surface in reference_surfaces(config) {
+        for reference in references(&surface.value) {
+            if let Token::Env(name) = &reference.token
+                && let Some(value) = source.lookup(name).value
+            {
+                redactor.register(name, &value);
+            }
+        }
+    }
+
     if let Some(declaration) = &resolved.secrets.declaration {
         for name in declaration.0.keys() {
             if let Some(value) = source.lookup(name).value {
@@ -166,9 +190,20 @@ pub fn redactor_for(config: &Config, resolved: &Resolved) -> Redactor {
         }
     }
 
+    let no_session = BTreeMap::new();
+    let no_files = BTreeMap::new();
+    let resolver = Resolver {
+        vars: &resolved.vars,
+        session: &no_session,
+        env: source.as_ref(),
+        files: &no_files,
+    };
     for (user, spec) in &resolved.users {
-        if let Some(Some(token)) = &spec.token {
-            redactor.register(&format!("USER_{user}"), token);
+        let Some(Some(token)) = &spec.token else {
+            continue;
+        };
+        if let Ok(Value::String(value)) = resolver.resolve_str(token) {
+            redactor.register(&format!("USER_{user}"), &value);
         }
     }
 

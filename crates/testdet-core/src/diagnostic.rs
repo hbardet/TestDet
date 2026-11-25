@@ -233,6 +233,8 @@ pub mod codes {
     pub const E_VERSION: &str = "E_VERSION";
     pub const E_DUPLICATE_KEY: &str = "E_DUPLICATE_KEY";
     pub const E_TRANSPORT: &str = "E_TRANSPORT";
+    /// A login operation answered but did not authenticate the user (§7.7).
+    pub const E_LOGIN_FAILED: &str = "E_LOGIN_FAILED";
     /// A `capture:` path did not resolve in the JSON response body. The spec
     /// (§7.7, §7.13) has no dedicated code for this; recorded as a gap.
     pub const E_UNRESOLVED_CAPTURE: &str = "E_UNRESOLVED_CAPTURE";

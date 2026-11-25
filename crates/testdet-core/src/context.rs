@@ -77,7 +77,15 @@ impl RunContext {
 
     /// Emit an event to the configured sink. A closed (dropped) channel is
     /// silently ignored — a disconnected frontend must never fail a run.
-    pub fn emit(&self, event: Event) {
+    ///
+    /// The payload is scrubbed through this context's redactor first (§7.12):
+    /// a `Failed` diagnostic and its hint are free text built from user-authored
+    /// templates, so they can carry a secret the outcome-level redaction never
+    /// sees. [`Event::redact`] scrubs every value-carrying field, including a
+    /// `Finished` outcome's body; the other variants carry only counts and
+    /// timings, so there is no raw byte payload to scrub.
+    pub fn emit(&self, mut event: Event) {
+        event.redact(&self.redactor);
         if let Some(sink) = &self.events {
             let _ = sink.send(event);
         }

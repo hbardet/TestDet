@@ -200,7 +200,9 @@ pub(crate) async fn execute_with_session(
 
     let request = match prepare_with_session(ctx, operation, session, session_headers) {
         Ok(request) => request,
-        Err(diagnostics) => return failure_outcome(ctx, operation, &diagnostics),
+        Err(diagnostics) => {
+            return failure_outcome_with_kind(ctx, operation, &diagnostics, TransportKind::Prepare);
+        }
     };
 
     let mut outcome = send(ctx, request, client).await;
@@ -209,11 +211,14 @@ pub(crate) async fn execute_with_session(
     if matches!(&operation.request, Request::Graphql(_))
         && let Some(body) = &outcome.body
     {
-        let (errors, _shape) = read_envelope(body);
+        let (errors, shape) = read_envelope(body);
         outcome.graphql_errors = errors;
+        outcome.shape = shape;
     }
 
-    outcome.redact(&ctx.redactor);
+    // The outcome is deliberately left unredacted here: the session store
+    // captures `{{session.*}}` values from the raw response, then redacts.
+    // `Finished` is scrubbed inside [`RunContext::emit`] (§7.12).
     ctx.emit(Event::Finished {
         outcome: outcome.clone(),
     });
@@ -288,7 +293,7 @@ fn prepare_graphql(
         .as_deref()
         .map(|path| resolve_text(resolver, path, diagnostics).unwrap_or_else(|| path.to_string()))
         .unwrap_or_else(|| resolved.graphql_path.clone());
-    let url = resolved.url_for(&path);
+    let url = url_for_or_diagnostic(resolved, &path, diagnostics);
 
     let query = resolve_text(resolver, &request.query, diagnostics)
         .unwrap_or_else(|| request.query.clone());
@@ -350,7 +355,7 @@ fn prepare_http(
 
     let path =
         resolve_text(resolver, &request.path, diagnostics).unwrap_or_else(|| request.path.clone());
-    let url = resolved.url_for(&path);
+    let url = url_for_or_diagnostic(resolved, &path, diagnostics);
 
     let prepared = match &request.body {
         None => PreparedBody::bytes(None, None),
@@ -857,6 +862,7 @@ async fn send_once(
             ttfb: None,
         },
         transport_error: None,
+        shape: EnvelopeShape::Ok,
     })
 }
 
@@ -1042,18 +1048,64 @@ fn transport_failure(
             ttfb: None,
         },
         transport_error: Some(TransportError { kind, message }),
+        shape: EnvelopeShape::Ok,
+    }
+}
+
+/// Join a resolved path onto the base URL, turning a failed join into an
+/// `E_UNRESOLVED_REF` diagnostic (F14) and falling back to the base only for
+/// the placeholder URL of a request that will never be sent.
+fn url_for_or_diagnostic(
+    resolved: &crate::config::Resolved,
+    path: &str,
+    diagnostics: &mut Diagnostics,
+) -> Url {
+    match resolved.url_for(path) {
+        Ok(url) => url,
+        Err(diagnostic) => {
+            diagnostics.push(*diagnostic);
+            resolved.base_url.clone()
+        }
     }
 }
 
 /// A template or session failure: no request is sent, every diagnostic
-/// becomes a `Failed` event, and the outcome carries the rendered text as an
-/// `Other` transport error.
+/// becomes a `Failed` event, and the outcome carries the rendered text as a
+/// transport error of `kind`.
 pub(crate) fn failure_outcome(
     ctx: &RunContext,
     operation: &Operation,
     diagnostics: &Diagnostics,
 ) -> Outcome {
+    failure_outcome_with_kind(ctx, operation, diagnostics, TransportKind::Other)
+}
+
+/// The [`failure_outcome`] body, with the transport category chosen by the
+/// caller: [`TransportKind::Prepare`] when the request could not be built (a
+/// config error), `Other` for a session failure.
+pub(crate) fn failure_outcome_with_kind(
+    ctx: &RunContext,
+    operation: &Operation,
+    diagnostics: &Diagnostics,
+    kind: TransportKind,
+) -> Outcome {
+    // A header template can be resolved twice (the merged layer plus the
+    // operation layer), so the same failure may be recorded twice; emit and
+    // render each distinct diagnostic once (F8).
+    let mut unique = Diagnostics::new();
+    let mut seen = std::collections::BTreeSet::new();
     for diagnostic in diagnostics.iter() {
+        let key = (
+            diagnostic.code,
+            diagnostic.path.clone(),
+            diagnostic.message.clone(),
+        );
+        if seen.insert(key) {
+            unique.push(diagnostic.clone());
+        }
+    }
+
+    for diagnostic in unique.iter() {
         ctx.emit(Event::Failed {
             diagnostic: diagnostic.clone(),
         });
@@ -1078,7 +1130,10 @@ pub(crate) fn failure_outcome(
         user: ctx.user.clone(),
         request: RequestEcho {
             method: method.as_str().to_string(),
-            url: ctx.resolved.url_for(&path).to_string(),
+            url: ctx
+                .resolved
+                .url_for(&path)
+                .map_or_else(|_| ctx.resolved.base_url.to_string(), |url| url.to_string()),
             headers: Vec::new(),
             body_size: 0,
         },
@@ -1095,9 +1150,10 @@ pub(crate) fn failure_outcome(
             ttfb: None,
         },
         transport_error: Some(TransportError {
-            kind: TransportKind::Other,
-            message: render_text(diagnostics),
+            kind,
+            message: render_text(&unique),
         }),
+        shape: EnvelopeShape::Ok,
     };
 
     outcome.redact(&ctx.redactor);
@@ -1157,5 +1213,6 @@ fn kind_label(kind: &TransportKind) -> &'static str {
         TransportKind::Tls => "tls",
         TransportKind::Cancelled => "cancelled",
         TransportKind::Other => "other",
+        TransportKind::Prepare => "prepare",
     }
 }

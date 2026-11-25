@@ -61,6 +61,8 @@ async fn run_cli(root: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
         command.current_dir(&root).args(&args);
         command.env_remove("TESTDET_RUN_TOKEN");
         command.env_remove("TESTDET_RUN_MISSING");
+        command.env_remove("LEAKY_TOKEN");
+        command.env_remove("USERS_ONLY_PASSWORD");
         for (key, value) in &envs {
             command.env(key, value);
         }
@@ -148,7 +150,7 @@ async fn no_user_flag_runs_anonymously_and_never_logs_in() {
         "anonymous must not log in"
     );
     assert_eq!(count(&server, "/echo").await, 1);
-    assert!(stderr(&output).contains("user: anonymous"));
+    assert!(stdout(&output).contains("user: anonymous"));
 }
 
 #[tokio::test]
@@ -508,4 +510,513 @@ async fn a_registered_secret_never_appears_on_stdout() {
         stdout(&output)
     );
     assert!(stdout(&output).contains("-CENSORED"), "{}", stdout(&output));
+}
+
+/// The secret from the first review: an `{{env.*}}` used by an operation with
+/// no declaration file at all.
+const LEAKY: &str = "zhah2Aeb0Ohpoo9qua6sha4eiph3Aes";
+
+#[tokio::test]
+async fn f1_an_env_secret_referenced_by_an_operation_never_leaks() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        &manifest(&server.uri()),
+    );
+    write(
+        root.path(),
+        "testdet/ops/leaky.yaml",
+        "id: leaky\nrequest:\n  kind: http\n  method: GET\n  path: /leak/{{env.LEAKY_TOKEN}}\n  headers:\n    authorization: Bearer {{env.LEAKY_TOKEN}}\n",
+    );
+    // Deliberately no `testdet/secrets/local.yaml`: the reference alone must
+    // seed the redactor (F1).
+
+    let output = run_cli(
+        root.path(),
+        &["run", "leaky", "--format", "json"],
+        &[("LEAKY_TOKEN", LEAKY)],
+    )
+    .await;
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let rendered = stdout(&output);
+    assert!(
+        !rendered.contains(LEAKY),
+        "the JSON output leaked: {rendered}"
+    );
+    // The echo carries the censor tag in both the URL and the header.
+    assert!(
+        rendered.contains("<LEAKY_TOKEN>-CENSORED"),
+        "no censor tag: {rendered}"
+    );
+    let parsed: Value = serde_json::from_str(rendered.trim()).expect("one JSON object");
+    assert!(
+        !parsed["request"]["url"]
+            .as_str()
+            .unwrap_or("")
+            .contains(LEAKY),
+        "{parsed}"
+    );
+
+    // It was the REAL value on the wire: the reference did resolve.
+    let requests = server.received_requests().await.expect("recorded");
+    let request = requests.first().expect("one request");
+    assert_eq!(request.url.path(), format!("/leak/{LEAKY}"));
+    assert_eq!(
+        request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("Bearer {LEAKY}").as_str())
+    );
+}
+
+#[tokio::test]
+async fn f3_a_500_login_exits_non_zero() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        &manifest(&server.uri()),
+    );
+    write(
+        root.path(),
+        "testdet/users.yaml",
+        "defaultLogin: login\nusers:\n  alice:\n    credentials:\n      email: alice@example.test\n",
+    );
+    write(
+        root.path(),
+        "testdet/ops/login.yaml",
+        "id: login\nrequest:\n  kind: http\n  method: POST\n  path: /login\n",
+    );
+    write(
+        root.path(),
+        "testdet/ops/echo.yaml",
+        &http_op("echo", "/echo", ""),
+    );
+
+    let output = run_cli(root.path(), &["run", "echo", "--user", "alice"], &[]).await;
+
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a 500 login must not read as success"
+    );
+    let diagnostics = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        diagnostics.contains("could not log in") && diagnostics.contains("500"),
+        "the diagnostic names the login failure: {diagnostics}"
+    );
+    assert_eq!(
+        count(&server, "/echo").await,
+        0,
+        "no operation runs after a failed login"
+    );
+}
+
+#[tokio::test]
+async fn f3_a_graphql_errors_login_exits_non_zero() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "errors": [{ "message": "bad credentials" }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        &manifest(&server.uri()),
+    );
+    write(
+        root.path(),
+        "testdet/users.yaml",
+        "defaultLogin: login\nusers:\n  alice:\n    credentials:\n      email: alice@example.test\n",
+    );
+    write(
+        root.path(),
+        "testdet/ops/login.yaml",
+        "id: login\nrequest:\n  kind: graphql\n  query: mutation { login }\n",
+    );
+    write(
+        root.path(),
+        "testdet/ops/echo.yaml",
+        &http_op("echo", "/echo", ""),
+    );
+
+    let output = run_cli(root.path(), &["run", "echo", "--user", "alice"], &[]).await;
+
+    assert_ne!(output.status.code(), Some(0));
+    let diagnostics = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        diagnostics.contains("bad credentials"),
+        "the GraphQL errors reach the diagnostic: {diagnostics}"
+    );
+    assert_eq!(count(&server, "/echo").await, 0);
+}
+
+#[tokio::test]
+async fn f4_a_users_only_secret_is_required_and_never_sent_as_a_template() {
+    // Declared but unset: `run` refuses before the first request.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        &manifest(&server.uri()),
+    );
+    write(
+        root.path(),
+        "testdet/secrets/local.yaml",
+        "USERS_ONLY_PASSWORD:\n  description: only used by users.yaml\n",
+    );
+    write(
+        root.path(),
+        "testdet/users.yaml",
+        "defaultLogin: login\nusers:\n  alice:\n    credentials:\n      password: \"{{env.USERS_ONLY_PASSWORD}}\"\n",
+    );
+    write(
+        root.path(),
+        "testdet/ops/login.yaml",
+        "id: login\nrequest:\n  kind: http\n  method: POST\n  path: /login\n  headers:\n    x-password: \"{{session.credentials.password}}\"\n",
+    );
+    write(
+        root.path(),
+        "testdet/ops/echo.yaml",
+        &http_op("echo", "/echo", ""),
+    );
+
+    let output = run_cli(root.path(), &["run", "echo", "--user", "alice"], &[]).await;
+    assert_eq!(output.status.code(), Some(1));
+    let diagnostics = stderr(&output);
+    assert!(
+        diagnostics.contains("USERS_ONLY_PASSWORD"),
+        "the diagnostic names the secret: {diagnostics}"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "no request when a required secret is unset"
+    );
+
+    // Declared and set: the resolved value is on the wire, never the template.
+    let output = run_cli(
+        root.path(),
+        &["run", "echo", "--user", "alice"],
+        &[("USERS_ONLY_PASSWORD", "user-secret-value")],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+
+    let requests = server.received_requests().await.expect("recorded");
+    let login = requests
+        .iter()
+        .find(|request| request.url.path() == "/login")
+        .expect("the login request ran");
+    let header = login
+        .headers
+        .get("x-password")
+        .and_then(|value| value.to_str().ok());
+    assert_eq!(header, Some("user-secret-value"));
+    assert!(
+        !format!("{requests:?}").contains("{{env."),
+        "no literal template on the wire"
+    );
+}
+
+#[tokio::test]
+async fn f8_an_unresolvable_template_is_a_config_error_with_no_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        &manifest(&server.uri()),
+    );
+    write(
+        root.path(),
+        "testdet/ops/broken.yaml",
+        "id: broken\nrequest:\n  kind: http\n  method: GET\n  path: /broken\n  headers:\n    x-broken: \"{{var.missing}}\"\n",
+    );
+
+    let output = run_cli(root.path(), &["run", "broken"], &[]).await;
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a prepare failure is a config error, not an internal one"
+    );
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("missing"),
+        "one diagnostic names the variable: {combined}"
+    );
+    assert_eq!(
+        combined.matches("does not resolve").count(),
+        1,
+        "the message is rendered once: {combined}"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "no request when the request cannot be built"
+    );
+}
+
+#[tokio::test]
+async fn f9_capture_forces_body_retention_and_no_body_is_honoured_otherwise() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "captured-token-value"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/first"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "retention-only-value"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/second"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/plain"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        &manifest(&server.uri()),
+    );
+    write(
+        root.path(),
+        "testdet/users.yaml",
+        "defaultLogin: login\nusers:\n  alice:\n    credentials:\n      email: alice@example.test\n",
+    );
+    write(
+        root.path(),
+        "testdet/ops/login.yaml",
+        "id: login\nrequest:\n  kind: http\n  method: POST\n  path: /login\ncapture:\n  token: token\n",
+    );
+    write(
+        root.path(),
+        "testdet/ops/first.yaml",
+        "id: first\nrequest:\n  kind: http\n  method: GET\n  path: /first\ncapture:\n  copied: token\n",
+    );
+    write(
+        root.path(),
+        "testdet/ops/second.yaml",
+        "id: second\nrequest:\n  kind: http\n  method: GET\n  path: /second\n  headers:\n    x-captured: \"{{session.token}}\"\n",
+    );
+    write(
+        root.path(),
+        "testdet/ops/plain.yaml",
+        &http_op("plain", "/plain", ""),
+    );
+
+    // A capturing operation keeps its body even under `--no-body`, and the
+    // captured value is the real one.
+    let output = run_cli(
+        root.path(),
+        &[
+            "run",
+            "first",
+            "second",
+            "--user",
+            "alice",
+            "--no-body",
+            "--format",
+            "json",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let rendered = stdout(&output);
+    // The echo is censored (F2), but the captured value stays usable.
+    assert!(rendered.contains("<CAPTURE_TOKEN>-CENSORED"), "{rendered}");
+    assert!(rendered.contains("\"body_retained\":true"), "{rendered}");
+
+    let requests = server.received_requests().await.expect("recorded");
+    let second = requests
+        .iter()
+        .find(|request| request.url.path() == "/second")
+        .expect("the second request ran");
+    assert_eq!(
+        second
+            .headers
+            .get("x-captured")
+            .and_then(|value| value.to_str().ok()),
+        Some("captured-token-value")
+    );
+
+    // Without a capture, `--no-body` is honoured for an authenticated run too.
+    let output = run_cli(
+        root.path(),
+        &[
+            "run",
+            "plain",
+            "--user",
+            "alice",
+            "--no-body",
+            "--format",
+            "json",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    let parsed: Value = serde_json::from_str(stdout(&output).trim()).expect("one JSON object");
+    assert!(parsed["body"].is_null(), "{parsed}");
+    assert_eq!(parsed["body_retained"], false);
+}
+
+#[tokio::test]
+async fn f10_text_data_goes_to_stdout_and_only_diagnostics_to_stderr() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        &manifest(&server.uri()),
+    );
+    write(
+        root.path(),
+        "testdet/ops/echo.yaml",
+        &http_op("echo", "/echo", ""),
+    );
+
+    // A declaration plus a reference gives `env` a row to print.
+    write(
+        root.path(),
+        "testdet/secrets/local.yaml",
+        "SOME_SECRET:\n  description: unused but listed\n",
+    );
+    write(
+        root.path(),
+        "testdet/ops/uses-secret.yaml",
+        &http_op("uses-secret", "/s/{{env.SOME_SECRET}}", ""),
+    );
+
+    for args in [
+        vec!["config"],
+        vec!["show", "echo"],
+        vec!["run", "echo"],
+        vec!["env"],
+    ] {
+        let output = run_cli(root.path(), &args, &[]).await;
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?} stderr: {}",
+            stderr(&output)
+        );
+        assert!(
+            !stdout(&output).is_empty(),
+            "{args:?} text data belongs on stdout"
+        );
+        assert!(
+            stderr(&output).is_empty(),
+            "{args:?} printed diagnostics on success: {}",
+            stderr(&output)
+        );
+    }
+}
+
+#[tokio::test]
+async fn f14_an_unjoinable_path_exits_one_and_sends_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        &manifest(&server.uri()),
+    );
+    write(
+        root.path(),
+        "testdet/ops/bad-url.yaml",
+        "id: bad-url\nrequest:\n  kind: http\n  method: GET\n  path: \"http://[::1\"\n",
+    );
+
+    let output = run_cli(root.path(), &["run", "bad-url"], &[]).await;
+
+    assert_eq!(output.status.code(), Some(1));
+    let combined = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        combined.contains("cannot build a request URL"),
+        "the join failure is a diagnostic: {combined}"
+    );
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("recorded")
+            .is_empty(),
+        "a failed join never falls back to the base URL"
+    );
 }

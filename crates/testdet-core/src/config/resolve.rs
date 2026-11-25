@@ -177,12 +177,22 @@ impl Resolved {
     /// The base path is normalised to end with `/` and the incoming path's
     /// leading `/` is stripped before [`reqwest::Url::join`], so neither a
     /// doubled slash nor a lost base path prefix is possible. An absolute URL
-    /// (`http://…`) is returned as-is; when joining fails the base is returned.
-    pub fn url_for(&self, path: &str) -> reqwest::Url {
+    /// (`http://…`) is returned as-is.
+    ///
+    /// A failed join is never silently papered over: returning the base URL
+    /// would send the request somewhere the config never asked for, so it
+    /// comes back as an `E_UNRESOLVED_REF` diagnostic that `prepare` turns
+    /// into a config error.
+    ///
+    /// # Errors
+    ///
+    /// `E_UNRESOLVED_REF` when the resolved path cannot be joined onto the
+    /// base URL. The diagnostic is boxed so the success type stays small.
+    pub fn url_for(&self, path: &str) -> Result<reqwest::Url, Box<Diagnostic>> {
         if let Ok(absolute) = reqwest::Url::parse(path)
             && !absolute.scheme().is_empty()
         {
-            return absolute;
+            return Ok(absolute);
         }
 
         let mut base = self.base_url.clone();
@@ -191,8 +201,20 @@ impl Resolved {
             base.set_path(&format!("{base_path}/"));
         }
 
-        base.join(path.trim_start_matches('/'))
-            .unwrap_or_else(|_| self.base_url.clone())
+        base.join(path.trim_start_matches('/')).map_err(|error| {
+            Box::new(Diagnostic {
+                code: codes::E_UNRESOLVED_REF,
+                severity: Severity::Error,
+                file: None,
+                span: None,
+                path: Some("request.path".to_string()),
+                message: format!("cannot build a request URL from `{path}`: {error}"),
+                hint: Some(format!(
+                    "the path must be relative to the base URL `{}`",
+                    self.base_url
+                )),
+            })
+        })
     }
 
     /// The four header layers for `operation` made as `user`, lowest to

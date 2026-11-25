@@ -261,3 +261,59 @@ fn required_vars_reports_the_origin_never_the_value() {
         "the secret value must never appear: {rendered}"
     );
 }
+
+#[test]
+fn f4_a_secret_referenced_only_from_users_yaml_is_checked_and_required() {
+    let root = TempDir::new().unwrap();
+    let manifest = manifest_from(json!({
+        "version": 1,
+        "collections": [],
+        "baseUrl": "http://localhost:8080"
+    }));
+
+    // A declaration file that omits the users-only names makes them
+    // undeclared references (§7.11).
+    let mut secrets = SecretsDeclaration::default();
+    secrets.0.insert("OTHER".into(), no_default());
+
+    let mut config = config_with(
+        manifest,
+        root.path().to_path_buf(),
+        BTreeMap::new(),
+        Some(secrets),
+    );
+    config.users.insert(
+        "alice".to_string(),
+        serde_json::from_value(json!({
+            "credentials": { "password": "{{env.USERS_ONLY_SECRET}}" },
+            "token": "{{env.USERS_ONLY_TOKEN}}",
+            "tokenHeader": "X-Token"
+        }))
+        .expect("user fixture is valid"),
+    );
+
+    // Undeclared: an error that names the users-file path, not an operation.
+    let cross = crosscheck(&config);
+    let credential = cross
+        .iter()
+        .find(|d| d.code == codes::E_UNKNOWN_ENV && d.message.contains("USERS_ONLY_SECRET"))
+        .expect("E_UNKNOWN_ENV for the credential template");
+    assert_eq!(credential.severity, Severity::Error);
+    assert_eq!(
+        credential.path.as_deref(),
+        Some("users.alice.credentials.password")
+    );
+
+    let token = cross
+        .iter()
+        .find(|d| d.code == codes::E_UNKNOWN_ENV && d.message.contains("USERS_ONLY_TOKEN"))
+        .expect("E_UNKNOWN_ENV for the token template");
+    assert_eq!(token.path.as_deref(), Some("users.alice.token"));
+
+    // The same surface feeds `required_vars`, so the two cannot drift.
+    let requirements = required_vars(&config);
+    let requirement = &requirements["USERS_ONLY_SECRET"];
+    assert!(!requirement.declared);
+    assert_eq!(requirement.used_by, vec!["users.yaml".to_string()]);
+    assert!(requirements.contains_key("USERS_ONLY_TOKEN"));
+}

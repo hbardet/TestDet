@@ -204,8 +204,8 @@ pub fn run(argv: Vec<OsString>) -> u8 {
                 env: args.env,
                 format: args.format,
             });
-            // The body (text or json) belongs on stdout; diagnostics and usage
-            // errors go to stderr (ruling 7).
+            // Text data and machine output both belong on stdout; only
+            // diagnostics and usage errors go to stderr (F10).
             emit(exit, &output, exit == Exit::Ok)
         }
         Commands::Show(args) => {
@@ -215,9 +215,10 @@ pub fn run(argv: Vec<OsString>) -> u8 {
                 id: args.id,
                 format,
             });
-            // Only a successfully resolved operation in JSON form belongs on
-            // stdout; diagnostics and usage errors are text and go to stderr.
-            emit(exit, &output, format == Format::Json && exit == Exit::Ok)
+            // The operation view is data, in either format, so it belongs on
+            // stdout; diagnostics and usage errors go to stderr (F10).
+            let _ = format;
+            emit(exit, &output, exit == Exit::Ok)
         }
         Commands::Config(args) => {
             let format = args.format;
@@ -227,9 +228,10 @@ pub fn run(argv: Vec<OsString>) -> u8 {
                 user: args.user,
                 format,
             });
-            // The JSON config view belongs on stdout on success; text output,
-            // diagnostics and usage errors go to stderr.
-            emit(exit, &output, format == Format::Json && exit == Exit::Ok)
+            // The config view is data, in either format, so it belongs on
+            // stdout; diagnostics and usage errors go to stderr (F10).
+            let _ = format;
+            emit(exit, &output, exit == Exit::Ok)
         }
         Commands::Run(args) => {
             let format = args.format;
@@ -244,15 +246,16 @@ pub fn run(argv: Vec<OsString>) -> u8 {
                 no_body: args.no_body,
                 timeout: args.timeout,
             });
-            // Outcomes are the machine-readable body (ndjson, or one pretty
-            // object for a single operation under `json`) and belong on
-            // stdout even when an operation failed (exit 2) or the engine
-            // produced an internal outcome (exit 4). Selection, user and
-            // config failures render text diagnostics, which go to stderr.
-            let machine = matches!(format, Format::Json | Format::Ndjson);
-            let rendered_outcomes =
+            // Outcomes are data — the text blocks as much as the ndjson/json
+            // objects — and belong on stdout even when an operation failed
+            // (exit 2) or the engine produced an internal outcome (exit 4).
+            // A run that never produced a result (exit 1: selection, unset
+            // secret, unresolvable template; exit 3: usage) prints
+            // diagnostics, which go to stderr in either format (F10).
+            let produced_outcomes =
                 matches!(exit, Exit::Ok | Exit::TransportFailure | Exit::Internal);
-            emit(exit, &output, machine && rendered_outcomes)
+            let _ = format;
+            emit(exit, &output, produced_outcomes)
         }
         Commands::Tui | Commands::Schema => {
             eprintln!("not implemented");

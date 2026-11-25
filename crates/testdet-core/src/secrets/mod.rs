@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde::ser::SerializeStruct;
 
-use crate::config::crosscheck::scan_surface;
+use crate::config::crosscheck::reference_surfaces;
 use crate::config::discover::Config;
 use crate::config::model::{SecretSource as SourceKind, SecretsDeclaration};
 use crate::config::resolve::{SecretsConfig, resolve};
@@ -274,14 +274,17 @@ fn default_lookup(declaration: &Option<SecretsDeclaration>, name: &str) -> Looku
 
 // --- requirement collection -----------------------------------------------
 
-/// Collect names, `declared` and `used_by` across the operation scan surface.
+/// Collect names, `declared` and `used_by` across every reference surface the
+/// config has: the operations and `users.yaml` (credentials, `token`,
+/// `tokenHeader`, `headers`, `vars`). `used_by` names the owning operation, or
+/// [`USERS_SURFACE`] for a reference made from the users file, so a secret
+/// used only there is still required, warned about and cross-checked.
 /// `set` and `origin` are left `false`/`None` for the caller to fill.
 fn collect_requirements(config: &Config) -> BTreeMap<String, VarRequirement> {
     let mut requirements: BTreeMap<String, VarRequirement> = BTreeMap::new();
 
-    for (id, operation) in &config.operations {
-        let surface = scan_surface(operation);
-        for reference in references(&surface) {
+    for surface in reference_surfaces(config) {
+        for reference in references(&surface.value) {
             if let Token::Env(name) = &reference.token {
                 let requirement =
                     requirements
@@ -295,7 +298,7 @@ fn collect_requirements(config: &Config) -> BTreeMap<String, VarRequirement> {
                             origin: None,
                             used_by: Vec::new(),
                         });
-                requirement.used_by.push(id.clone());
+                requirement.used_by.push(surface.owner.clone());
             }
         }
     }

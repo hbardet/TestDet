@@ -33,10 +33,8 @@ pub async fn execute_for_user(
         return store.fail(user, operation, diagnostic);
     }
 
-    let retain_body = !operation.capture.is_empty();
-    let first = store.run(user, operation, retain_body).await;
+    let first = store.run(user, operation, false).await;
     if !is_auth_failure(&first) {
-        store.capture_response(user, operation, &first);
         return first;
     }
 
@@ -45,9 +43,7 @@ pub async fn execute_for_user(
         return store.fail(user, operation, diagnostic);
     }
 
-    let second = store.run(user, operation, retain_body).await;
-    store.capture_response(user, operation, &second);
-    second
+    store.run(user, operation, false).await
 }
 
 /// Whether an outcome means "the caller is not authenticated".

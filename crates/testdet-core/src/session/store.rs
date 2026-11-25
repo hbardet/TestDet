@@ -25,7 +25,7 @@ use crate::outcome::Outcome;
 use crate::secrets::build_source;
 use crate::template::Resolver;
 
-use super::login::{is_auth_failure, login_operation};
+use super::login::login_operation;
 
 /// One user's live session.
 ///
@@ -140,12 +140,11 @@ impl SessionStore {
             .run(user, &operation, !operation.capture.is_empty())
             .await;
 
-        if outcome.transport_error.is_some() || is_auth_failure(&outcome) {
+        // A login that 500s, answers with GraphQL errors or never reaches the
+        // server has not authenticated anyone: do not mark the session, and
+        // let the caller's exit code reflect the diagnostic (§7.7, F3).
+        if !login_succeeded(&outcome) {
             return Err(login_failure(user, &login_id, &outcome));
-        }
-
-        if let Some(body) = outcome.body {
-            self.capture_into(user, &operation.capture, &body);
         }
 
         self.mark_logged_in(user);
@@ -224,7 +223,9 @@ impl SessionStore {
         }
 
         for (name, value) in &captured {
-            if let Value::String(secret) = value {
+            if let Value::String(secret) = value
+                && !secret.contains("-CENSORED")
+            {
                 self.ctx
                     .redactor
                     .register(&format!("CAPTURE_{}", name.to_uppercase()), secret);
@@ -256,17 +257,22 @@ impl SessionStore {
 
     /// Run `operation` as `user` through that user's session client.
     ///
-    /// `retain_body` forces body retention for this call: a capturing operation
-    /// (or a login with a `capture:` map) needs the body, whatever the caller's
-    /// `retain_body` setting. The client and variable/header maps are cloned
-    /// before the first `await`, so no `self` borrow is held across it
-    /// (requirement 8).
+    /// `retain_body` forces body retention for this call. A `capture:` map
+    /// forces it too: capturing is impossible without the body, so `--no-body`
+    /// cannot make a capturing operation silently capture nothing (§7.9, F9).
+    /// The client and variable/header maps are cloned before the first `await`,
+    /// so no `self` borrow is held across it (requirement 8).
+    ///
+    /// Captures happen here, from the RAW body, before redaction: a captured
+    /// token must be what the server sent, never `<CAPTURE_TOKEN>-CENSORED`
+    /// (F2). The returned outcome is already redacted.
     pub(crate) async fn run(
         &mut self,
         user: Option<&str>,
         operation: &Operation,
         retain_body: bool,
     ) -> Outcome {
+        let retain_body = retain_body || !operation.capture.is_empty();
         let mut ctx = self.ctx.clone().with_user(user.map(str::to_string));
         if retain_body {
             ctx.retain_body = true;
@@ -276,24 +282,15 @@ impl SessionStore {
         let headers = self.session_headers(user).to_vec();
         self.active_operation = Some(operation.id.clone());
 
-        crate::engine::execute_with_session(&ctx, operation, &client, &vars, &headers).await
-    }
+        let mut outcome =
+            crate::engine::execute_with_session(&ctx, operation, &client, &vars, &headers).await;
 
-    /// Capture `operation`'s `capture:` map out of `outcome`'s body, if it
-    /// declared one and the body was kept.
-    pub(crate) fn capture_response(
-        &mut self,
-        user: Option<&str>,
-        operation: &Operation,
-        outcome: &Outcome,
-    ) {
-        if operation.capture.is_empty() {
-            return;
-        }
-        self.active_operation = Some(operation.id.clone());
         if let Some(body) = &outcome.body {
             self.capture_into(user, &operation.capture, body);
         }
+
+        outcome.redact(&ctx.redactor);
+        outcome
     }
 
     /// Drop `user`'s session: the next [`ensure`](Self::ensure) re-authenticates
@@ -461,15 +458,30 @@ fn static_token_header(resolved: &Resolved, user: Option<&str>) -> Option<(Strin
     Some((header, value))
 }
 
-/// A diagnostic for a login that did not authenticate: it names the user and
-/// the login operation and never the response body (§7.12).
+/// Whether a login outcome actually authenticated the user: a 4xx/5xx
+/// status, any GraphQL error, or a transport error means it did not (§7.7).
+fn login_succeeded(outcome: &Outcome) -> bool {
+    outcome.transport_error.is_none() && outcome.status < 400 && outcome.graphql_errors.is_empty()
+}
+
+/// A diagnostic for a login that did not authenticate: it names the user, the
+/// login operation and the status, and never the response body (§7.12).
 fn login_failure(user: Option<&str>, login_id: &str, outcome: &Outcome) -> Diagnostic {
-    let detail = match &outcome.transport_error {
-        Some(error) => format!("transport error: {}", error.message),
-        None => format!("the login response had status {}", outcome.status),
+    let detail = if let Some(error) = &outcome.transport_error {
+        format!("transport error: {}", error.message)
+    } else if !outcome.graphql_errors.is_empty() {
+        let messages = outcome
+            .graphql_errors
+            .iter()
+            .map(|error| error.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("graphql errors: {messages}")
+    } else {
+        format!("the login response had status {}", outcome.status)
     };
     Diagnostic {
-        code: codes::E_TRANSPORT,
+        code: codes::E_LOGIN_FAILED,
         severity: Severity::Error,
         file: None,
         span: None,

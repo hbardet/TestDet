@@ -401,7 +401,10 @@ fn url_joining_does_not_double_the_slash() {
     let resolved = resolve(&config, None, &[]).unwrap();
 
     assert_eq!(
-        resolved.url_for("/v1/users").as_str(),
+        resolved
+            .url_for("/v1/users")
+            .expect("the path joins")
+            .as_str(),
         "http://h:8080/v1/users"
     );
 }
@@ -416,7 +419,10 @@ fn url_joining_preserves_a_base_path_prefix() {
     let config = config_with(manifest, BTreeMap::new(), None);
     let resolved = resolve(&config, None, &[]).unwrap();
 
-    assert_eq!(resolved.url_for("/v1/x").as_str(), "https://h/api/v1/x");
+    assert_eq!(
+        resolved.url_for("/v1/x").expect("the path joins").as_str(),
+        "https://h/api/v1/x"
+    );
 }
 
 #[test]
@@ -447,4 +453,24 @@ environments:
         })
         .expect("E_UNKNOWN_FIELD at environments.local.collections");
     assert_eq!(err.severity, Severity::Error);
+}
+
+#[test]
+fn f14_an_unjoinable_path_is_a_diagnostic_not_a_silent_base_url() {
+    let manifest = manifest_from(json!({
+        "version": 1,
+        "collections": [],
+        "baseUrl": "https://h/api/"
+    }));
+    let config = config_with(manifest, BTreeMap::new(), None);
+    let resolved = resolve(&config, None, &[]).unwrap();
+
+    let result = resolved.url_for("http://[::1");
+    let diagnostic = result.expect_err("a failed join must not fall back to the base URL");
+    assert_eq!(diagnostic.code, codes::E_UNRESOLVED_REF);
+    assert!(
+        diagnostic.message.contains("[::1"),
+        "the diagnostic names the path: {}",
+        diagnostic.message
+    );
 }

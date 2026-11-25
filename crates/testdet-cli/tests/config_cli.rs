@@ -155,3 +155,86 @@ fn ndjson_is_a_usage_error_for_config() {
     assert_eq!(exit, Exit::Usage);
     assert!(output.contains("`--format ndjson` only applies to `run`"));
 }
+
+#[test]
+fn f7_the_view_resolves_templates_and_never_hides_what_it_cannot() {
+    unsafe {
+        std::env::set_var("VIEW_TOKEN", "view-secret-value");
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    write(
+        root.path(),
+        "testdet/testdet.yaml",
+        "version: 1\nname: my-api\ncollections: []\ndefaultEnvironment: local\nenvironments:\n  local:\n    baseUrl: https://local.example.com\n    secrets:\n      source: env\n    headers:\n      Authorization: Bearer {{env.VIEW_TOKEN}}\n    vars:\n      base: \"{{env.VIEW_TOKEN}}\"\n      sessionRef: \"{{session.token}}\"\n      missing: \"{{var.absent}}\"\n",
+    );
+    write(
+        root.path(),
+        "testdet/secrets/local.yaml",
+        "VIEW_TOKEN:\n  description: view\n",
+    );
+    let config = root.path().join("testdet/testdet.yaml");
+
+    // JSON: resolved values, literals kept for what cannot resolve, and an
+    // explicit `unresolved` list (F7).
+    let (exit, output) = config::run(ConfigArgs {
+        config: Some(config.clone()),
+        env: None,
+        user: None,
+        format: Format::Json,
+    });
+    assert_eq!(exit, Exit::Ok);
+    assert!(!output.contains("view-secret-value"));
+
+    let parsed: serde_json::Value = serde_json::from_str(&output).expect("pretty JSON");
+    assert_eq!(
+        parsed["headers"]["Authorization"],
+        "Bearer <VIEW_TOKEN>-CENSORED"
+    );
+    assert_eq!(parsed["vars"]["base"], "<VIEW_TOKEN>-CENSORED");
+    assert_eq!(parsed["vars"]["sessionRef"], "{{session.token}}");
+    assert_eq!(parsed["vars"]["missing"], "{{var.absent}}");
+
+    let unresolved = parsed["unresolved"]
+        .as_array()
+        .expect("an unresolved array");
+    let paths: Vec<&str> = unresolved
+        .iter()
+        .filter_map(|entry| entry["path"].as_str())
+        .collect();
+    assert!(paths.contains(&"vars.sessionRef"), "{paths:?}");
+    assert!(paths.contains(&"vars.missing"), "{paths:?}");
+    assert!(
+        unresolved
+            .iter()
+            .any(|entry| entry["template"] == "{{session.token}}"),
+        "{unresolved:?}"
+    );
+
+    // Text: the template stays visible beside the censored value.
+    let (exit, output) = config::run(ConfigArgs {
+        config: Some(config),
+        env: None,
+        user: None,
+        format: Format::Text,
+    });
+    assert_eq!(exit, Exit::Ok);
+    assert!(
+        output.contains("Authorization: Bearer {{env.VIEW_TOKEN}} (Bearer <VIEW_TOKEN>-CENSORED)"),
+        "{output}"
+    );
+    assert!(
+        output.contains("sessionRef: {{session.token}} (unresolved)"),
+        "{output}"
+    );
+    assert!(output.contains("unresolved:\n"), "{output}");
+    assert!(
+        output.contains("vars.sessionRef: {{session.token}}"),
+        "{output}"
+    );
+    assert!(!output.contains("view-secret-value"));
+
+    unsafe {
+        std::env::remove_var("VIEW_TOKEN");
+    }
+}

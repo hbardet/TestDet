@@ -7,14 +7,17 @@
 //! while the raw bytes stay in [`crate::Outcome::body`] for a human to read
 //! (§7.9).
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::outcome::GraphQLError;
 
 /// How a response body's GraphQL envelope looked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum EnvelopeShape {
     /// A JSON object; `errors`, when present, was an array.
+    #[default]
     Ok,
     /// Not UTF-8, or not JSON at all (an HTML error page, a PNG, …).
     NotJson,

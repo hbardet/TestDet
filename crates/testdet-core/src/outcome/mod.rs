@@ -17,6 +17,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::engine::EnvelopeShape;
 use crate::redact::Redactor;
 
 /// The serialisable record of one completed operation attempt.
@@ -29,15 +30,27 @@ pub struct Outcome {
     pub headers: Vec<(String, String)>,
     pub cookies: Vec<CookieInfo>,
     /// Base64-encoded when retained; `null` when `body_retained` is `false`.
+    ///
+    /// After [`Outcome::redact`] the bytes may differ from the wire: a JSON
+    /// body is re-serialised compactly so a string value can be scrubbed in
+    /// place, so its whitespace (and therefore its length) can change while
+    /// [`Outcome::body_size`] keeps the received byte count.
     #[serde(with = "base64_bytes")]
     pub body: Option<Bytes>,
     /// Whether `body` was kept at all (§7.9 body retention).
     pub body_retained: bool,
-    /// Size in bytes of the received body, set regardless of retention.
+    /// Size in bytes of the received body, set regardless of retention and
+    /// never recomputed after redaction: it always describes the wire.
     pub body_size: u64,
     pub graphql_errors: Vec<GraphQLError>,
     pub timing: Timing,
     pub transport_error: Option<TransportError>,
+    /// The GraphQL envelope the server answered with (§7.9). Always `Ok` for
+    /// a non-GraphQL request; `not-json`, `not-an-object` or
+    /// `errors-not-an-array` say the server did not answer in the expected
+    /// shape, which is different from a clean empty answer.
+    #[serde(rename = "envelope", default)]
+    pub shape: EnvelopeShape,
 }
 
 impl Outcome {
@@ -46,7 +59,11 @@ impl Outcome {
     /// values, and the body.
     ///
     /// The body is scrubbed only when it is valid UTF-8: a JSON body is walked
-    /// value-by-value and re-serialised, other UTF-8 text is scrubbed whole.
+    /// value-by-value, other UTF-8 text is scrubbed whole. The bytes are
+    /// rewritten only when scrubbing actually changed something, and JSON is
+    /// re-serialised compactly — so a rewritten body may differ from the wire
+    /// in whitespace (see the [`Outcome::body`] note). [`Outcome::body_size`]
+    /// is never touched: it keeps the received byte count.
     /// Non-UTF-8 bytes are left untouched — we cannot safely interpret them as
     /// text, so we scrub nothing rather than corrupt them.
     pub fn redact(&mut self, redactor: &Redactor) {
@@ -77,12 +94,18 @@ impl Outcome {
         {
             let scrubbed = match serde_json::from_str::<Value>(text) {
                 Ok(mut value) => {
+                    let before = value.clone();
                     redactor.scrub_json(&mut value);
-                    value.to_string()
+                    (value != before).then(|| value.to_string())
                 }
-                Err(_) => redactor.scrub(text),
+                Err(_) => {
+                    let scrubbed = redactor.scrub(text);
+                    (scrubbed != text).then_some(scrubbed)
+                }
             };
-            self.body = Some(Bytes::from(scrubbed));
+            if let Some(scrubbed) = scrubbed {
+                self.body = Some(Bytes::from(scrubbed));
+            }
         }
         // Non-UTF-8 bytes are left untouched: we cannot safely interpret
         // them as text, so we scrub nothing rather than corrupt them.
@@ -150,6 +173,10 @@ pub enum TransportKind {
     Tls,
     Cancelled,
     Other,
+    /// The request never left: building it failed (an unresolvable template,
+    /// a file that could not be read, a URL that would not join). This is a
+    /// config error, not a network one — `run` maps it to exit 1.
+    Prepare,
 }
 
 /// Serialise a [`Duration`] as integer milliseconds (and back).

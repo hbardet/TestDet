@@ -86,13 +86,21 @@ fn the_registry_grows_after_construction() {
 }
 
 #[test]
-fn register_skips_empty_and_short_values() {
+fn f13_short_values_are_registered_exactly() {
     let redactor = Redactor::new();
-    redactor.register("SHORT", "abc"); // 3 bytes: below the threshold
+    redactor.register("SHORT", "abc"); // 3 bytes: exact form only
     redactor.register("EMPTY", "");
-    redactor.register("OK", "abcd"); // 4 bytes: registered
+    redactor.register("OK", "abcd"); // 4 bytes: encoded variants too
 
-    assert_eq!(redactor.scrub("abc"), "abc");
+    // Any non-empty value is a secret, however short (F13).
+    assert_eq!(redactor.scrub("abc"), "<SHORT>-CENSORED");
+    // A short value does not get the percent/base64 variants, which would
+    // censor unrelated output.
+    assert_eq!(redactor.scrub("YWJj"), "YWJj");
     assert_eq!(redactor.scrub("abcd"), "<OK>-CENSORED");
-    assert_eq!(redactor.names(), vec!["OK".to_string()]);
+    assert_eq!(
+        redactor.names(),
+        vec!["SHORT".to_string(), "OK".to_string()]
+    );
+    assert_eq!(redactor.scrub(""), "");
 }

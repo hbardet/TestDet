@@ -16,11 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use testdet_core::RunContext;
-use testdet_core::config::{Config, LoadOptions, load_config, resolve};
+use testdet_core::config::{Config, LoadOptions, USERS_SURFACE, load_config, resolve};
 use testdet_core::diagnostic::{Diagnostic, Diagnostics, Severity, codes, render_text};
 use testdet_core::execute;
 use testdet_core::operation::model::Operation;
-use testdet_core::outcome::Outcome;
+use testdet_core::outcome::{Outcome, TransportKind};
 use testdet_core::redact::redactor_for;
 use testdet_core::secrets::required_vars_for;
 use testdet_core::session::{SessionStore, execute_for_user};
@@ -104,7 +104,12 @@ pub fn run(args: RunArgs) -> (Exit, String) {
 
     // A declared-but-unset secret would otherwise be sent as an empty string.
     // Refuse before the first request (exit 1), naming variable and file.
-    let unset = unset_secrets(&config, &selected, args.env.as_deref());
+    let unset = unset_secrets(
+        &config,
+        &selected,
+        args.env.as_deref(),
+        args.user.as_deref(),
+    );
     if !unset.is_empty() {
         return (Exit::ConfigInvalid, render_text(&unset));
     }
@@ -241,9 +246,16 @@ pub fn worst_exit(outcomes: &[Outcome], had_config_error: bool) -> Exit {
 
 /// The exit code one outcome implies.
 fn outcome_exit(outcome: &Outcome) -> Exit {
-    if outcome.transport_error.is_some() {
-        Exit::TransportFailure
-    } else if outcome.status == 0 {
+    if let Some(error) = &outcome.transport_error {
+        // A request that could not be built (an unresolvable template, a file
+        // that could not be read) never reached the network: that is a config
+        // error, so exit 1 and let the diagnostic name the cause (F8).
+        if error.kind == TransportKind::Prepare {
+            return Exit::ConfigInvalid;
+        }
+        return Exit::TransportFailure;
+    }
+    if outcome.status == 0 {
         Exit::Internal
     } else {
         Exit::Ok
@@ -283,20 +295,15 @@ async fn fan_out(
 /// auth failure (§7.7.3). An anonymous run (ruling 2) must never log in —
 /// `ensure(None)` is already a no-op — and must also not take the re-login
 /// path on a 401, which would be a wasted round trip: the anonymous branch
-/// therefore calls the non-retrying engine primitive directly and captures the
-/// operation's own `capture:` map afterwards, as `execute_for_user` would.
+/// therefore calls the non-retrying engine primitive directly. The store
+/// captures the operation's own `capture:` map on the way out, as it does for
+/// `execute_for_user`.
 async fn run_one(store: &mut SessionStore, user: Option<&str>, operation: &Operation) -> Outcome {
     match user {
         Some(_) => execute_for_user(store, user, operation).await,
         None => {
             let _ = store.ensure(None).await;
-            let outcome = execute(store, operation).await;
-            if !operation.capture.is_empty()
-                && let Some(body) = outcome.body.as_deref()
-            {
-                store.capture_into(None, &operation.capture, body);
-            }
-            outcome
+            execute(store, operation).await
         }
     }
 }
@@ -477,7 +484,12 @@ fn unknown_user(user: &str, config: &Config) -> Diagnostics {
 ///
 /// An undeclared `{{env.X}}` is already a config error from `crosscheck`
 /// (`E_UNKNOWN_ENV`), so only the declared-but-unset case is handled here.
-fn unset_secrets(config: &Config, selected: &[String], env: Option<&str>) -> Diagnostics {
+fn unset_secrets(
+    config: &Config,
+    selected: &[String],
+    env: Option<&str>,
+    user: Option<&str>,
+) -> Diagnostics {
     let requirements = required_vars_for(config, env);
     let declaration: PathBuf = config
         .root_dir
@@ -489,10 +501,12 @@ fn unset_secrets(config: &Config, selected: &[String], env: Option<&str>) -> Dia
         if !requirement.declared || requirement.set {
             continue;
         }
-        let used = requirement
-            .used_by
-            .iter()
-            .any(|id| selected.iter().any(|selected| selected == id));
+        let used = requirement.used_by.iter().any(|id| {
+            selected.iter().any(|selected| selected == id)
+                // A secret reachable only from `users.yaml` is required exactly
+                // when an authenticated run could send it (F4).
+                || (id == USERS_SURFACE && user.is_some())
+        });
         if !used {
             continue;
         }
@@ -591,6 +605,7 @@ mod tests {
                 kind,
                 message: "connect error".to_string(),
             }),
+            shape: Default::default(),
         }
     }
 
