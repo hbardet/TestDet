@@ -283,10 +283,12 @@ impl App {
 
     /// Store one variable, as `s` does for a whole response (§7.16).
     ///
-    /// [`App::store_selection`] stores every field of the last response; this
-    /// is the single-value form. It exists so a host — or a test driving the
-    /// real driver — can put a value in the session store before any response
-    /// has arrived. The value stays in memory: nothing here is persisted.
+    /// What `s` does for a whole response, for one value.
+    ///
+    /// The key handler stores every field of the last response; this is the
+    /// single-value form. It exists so a host — or a test driving the real
+    /// driver — can put a value in the session store before any response has
+    /// arrived. The value stays in memory: nothing here is persisted.
     pub fn store_var(&mut self, name: &str, value: Value, source: impl Into<String>) {
         self.vars.store(name, value, source.into());
     }

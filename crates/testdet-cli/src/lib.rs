@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{config, env, run, show, tui, validate};
+use crate::commands::{config, env, run, schema, show, tui, validate};
 use crate::exit::Exit;
 use crate::format::Format;
 
@@ -38,8 +38,8 @@ enum Commands {
     Env(EnvCli),
     /// Show the resolved configuration.
     Config(ConfigCli),
-    /// Emit the JSON Schema for the config.
-    Schema,
+    /// Dump a server's GraphQL introspection result as JSON.
+    Schema(SchemaCli),
     /// Show a resolved operation.
     Show(ShowCli),
 }
@@ -56,6 +56,26 @@ struct ValidateCli {
     /// (`testdet/secrets/<env>.yaml`).
     #[arg(long)]
     env: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct SchemaCli {
+    /// Environment to resolve; defaults to the manifest `defaultEnvironment`.
+    #[arg(long)]
+    env: Option<String>,
+    /// Authenticate as this user before introspecting.
+    #[arg(long)]
+    user: Option<String>,
+    /// Write the dump to this file instead of stdout.
+    #[arg(long, value_name = "PATH")]
+    out: Option<PathBuf>,
+    /// Send the older query for servers that reject `specifiedByURL` /
+    /// `isRepeatable`.
+    #[arg(long)]
+    legacy: bool,
+    /// Overwrite an existing `--out` file.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(clap::Args)]
@@ -281,9 +301,17 @@ pub fn run(argv: Vec<OsString>) -> u8 {
             // which go to stderr once the terminal is back to normal (F10).
             emit(exit, &output, false)
         }
-        Commands::Schema => {
-            eprintln!("not implemented");
-            4
+        Commands::Schema(args) => {
+            let (exit, output) = schema::run(schema::SchemaArgs {
+                env: args.env,
+                user: args.user,
+                out: args.out,
+                legacy: args.legacy,
+                force: args.force,
+            });
+            // The dump is data and belongs on stdout; a refusal, a diagnostic
+            // or a transport failure is not (F10).
+            emit(exit, &output, exit == Exit::Ok)
         }
     }
 }

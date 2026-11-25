@@ -8,6 +8,7 @@
 pub mod config;
 pub mod env;
 pub mod run;
+pub mod schema;
 pub mod show;
 pub mod tui;
 pub mod validate;
