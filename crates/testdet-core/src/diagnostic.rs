@@ -225,6 +225,9 @@ pub mod codes {
     pub const E_FLAT_BODY_ONLY: &str = "E_FLAT_BODY_ONLY";
     pub const E_FORBIDDEN_HEADER: &str = "E_FORBIDDEN_HEADER";
     pub const E_PATH_ESCAPE: &str = "E_PATH_ESCAPE";
+    /// A file exceeded the 5 MB upload ceiling. The spec (§7.14) describes the
+    /// ceiling but names no code for it; recorded as a gap.
+    pub const E_FILE_TOO_LARGE: &str = "E_FILE_TOO_LARGE";
     pub const E_UNRESOLVED_REF: &str = "E_UNRESOLVED_REF";
     pub const E_MULTI_OPERATION: &str = "E_MULTI_OPERATION";
     pub const E_VERSION: &str = "E_VERSION";

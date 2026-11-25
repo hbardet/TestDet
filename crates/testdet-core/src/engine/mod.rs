@@ -18,11 +18,14 @@
 //! client that can).
 
 pub mod envelope;
+pub mod multipart;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Url;
@@ -32,14 +35,17 @@ use serde_json::Value;
 use crate::context::RunContext;
 use crate::diagnostic::{Diagnostic, Diagnostics, Severity, codes, render_text};
 use crate::events::Event;
-use crate::operation::model::{Body, Operation, Request};
+use crate::files::LoadedFile;
+use crate::operation::model::{Body, FileEncoding, FileSpec, Operation, Request};
 use crate::outcome::{CookieInfo, Outcome, RequestEcho, Timing, TransportError, TransportKind};
 use crate::secrets::build_source;
 use crate::session::SessionStore;
-use crate::template::Resolver;
+use crate::template::value::{Segment, scan};
+use crate::template::{Resolver, Token, parse_token};
 
 use envelope::graphql_body;
 pub use envelope::{EnvelopeShape, read_envelope};
+use multipart::{FilePart, MultipartPlan, build_graphql_multipart, build_rest_multipart};
 
 /// The pause between transport retries (§7.9 defaults: off unless configured).
 const RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -64,6 +70,35 @@ pub struct PreparedRequest {
     pub headers: Vec<(String, String)>,
     pub body: Option<Bytes>,
     pub content_type: Option<String>,
+    /// A multipart body to assemble at wire time, where the boundary is
+    /// `reqwest`'s to choose (§7.6). Never set together with `body`.
+    pub(crate) multipart: Option<MultipartPlan>,
+}
+
+/// The body side of a prepared request: bytes, the default `Content-Type` for
+/// those bytes, or the plan for a multipart body.
+struct PreparedBody {
+    body: Option<Bytes>,
+    content_type: Option<String>,
+    multipart: Option<MultipartPlan>,
+}
+
+impl PreparedBody {
+    fn bytes(body: Option<Bytes>, content_type: Option<&str>) -> Self {
+        Self {
+            body,
+            content_type: content_type.map(str::to_string),
+            multipart: None,
+        }
+    }
+
+    fn multipart(plan: MultipartPlan) -> Self {
+        Self {
+            body: None,
+            content_type: None,
+            multipart: Some(plan),
+        }
+    }
 }
 
 /// Resolve `operation`'s templates and build the request that will be sent.
@@ -111,11 +146,11 @@ pub(crate) fn prepare_with_session(
         &mut diagnostics,
     );
 
-    let (method, url, body, content_type) = match &operation.request {
+    let (method, url, prepared) = match &operation.request {
         Request::Graphql(request) => {
-            prepare_graphql(&resolver, resolved, request, &mut diagnostics)
+            prepare_graphql(ctx, &resolver, resolved, request, &mut diagnostics)
         }
-        Request::Http(request) => prepare_http(&resolver, resolved, request, &mut diagnostics),
+        Request::Http(request) => prepare_http(ctx, &resolver, resolved, request, &mut diagnostics),
     };
 
     if diagnostics.has_errors() {
@@ -126,8 +161,9 @@ pub(crate) fn prepare_with_session(
         method,
         url,
         headers,
-        body,
-        content_type,
+        body: prepared.body,
+        content_type: prepared.content_type,
+        multipart: prepared.multipart,
     })
 }
 
@@ -236,12 +272,17 @@ fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: String)
 }
 
 /// Build a GraphQL request: POST, JSON envelope, default or per-request path.
+///
+/// File variables split two ways (§7.14): `encoding: multipart` becomes a file
+/// part whose `operations` slot is nulled, while `encoding: base64` is
+/// inlined as a JSON string and no multipart body is built.
 fn prepare_graphql(
+    ctx: &RunContext,
     resolver: &Resolver<'_>,
     resolved: &crate::config::Resolved,
     request: &crate::operation::model::GraphqlRequest,
     diagnostics: &mut Diagnostics,
-) -> (reqwest::Method, Url, Option<Bytes>, Option<String>) {
+) -> (reqwest::Method, Url, PreparedBody) {
     let path = request
         .path
         .as_deref()
@@ -253,65 +294,298 @@ fn prepare_graphql(
         .unwrap_or_else(|| request.query.clone());
 
     let object = Value::Object(request.variables.clone().into_iter().collect());
-    let variables = resolve_value(resolver, &object, diagnostics);
-    let body_value = graphql_body(&query, &variables, request.operation_name.as_deref());
+    let mut variables = resolve_value(resolver, &object, diagnostics);
 
-    (
-        reqwest::Method::POST,
-        url,
-        encode_json(&body_value, diagnostics),
-        Some("application/json".to_string()),
-    )
+    let mut files: Vec<FilePart> = Vec::new();
+    for (name, value) in &request.variables {
+        let Some(spec_name) = value.as_str().and_then(whole_file_ref) else {
+            continue;
+        };
+        let Some(spec) = resolver.files.get(&spec_name) else {
+            continue;
+        };
+        let Some(file) = load_file(ctx, spec, &format!("files.{spec_name}"), diagnostics) else {
+            continue;
+        };
+        match spec.encoding {
+            FileEncoding::Base64 => {
+                if let Some(slots) = variables.as_object_mut() {
+                    slots.insert(name.clone(), Value::String(STANDARD.encode(&file.bytes)));
+                }
+            }
+            FileEncoding::Multipart => files.push(FilePart {
+                path: format!("variables.{name}"),
+                bytes: file.bytes,
+                mime: file.mime,
+                filename: file.filename,
+            }),
+        }
+    }
+
+    let body_value = graphql_body(&query, &variables, request.operation_name.as_deref());
+    let prepared = if files.is_empty() {
+        PreparedBody::bytes(
+            encode_json(&body_value, diagnostics),
+            Some("application/json"),
+        )
+    } else {
+        PreparedBody::multipart(MultipartPlan::Graphql {
+            body: body_value,
+            files,
+        })
+    };
+
+    (reqwest::Method::POST, url, prepared)
 }
 
 /// Build an HTTP request: method, path and body by kind.
 fn prepare_http(
+    ctx: &RunContext,
     resolver: &Resolver<'_>,
     resolved: &crate::config::Resolved,
     request: &crate::operation::model::HttpRequest,
     diagnostics: &mut Diagnostics,
-) -> (reqwest::Method, Url, Option<Bytes>, Option<String>) {
+) -> (reqwest::Method, Url, PreparedBody) {
     let method = parse_method(&request.method, diagnostics);
 
     let path =
         resolve_text(resolver, &request.path, diagnostics).unwrap_or_else(|| request.path.clone());
     let url = resolved.url_for(&path);
 
-    let (body, content_type) = match &request.body {
-        None => (None, None),
+    let prepared = match &request.body {
+        None => PreparedBody::bytes(None, None),
         Some(Body::Json(value)) => {
-            let value = resolve_value(resolver, value, diagnostics);
-            (
-                encode_json(&value, diagnostics),
-                Some("application/json".to_string()),
-            )
+            let mut value = resolve_value(resolver, value, diagnostics);
+            inline_base64_files(ctx, resolver, &mut value, "request.body.value", diagnostics);
+            PreparedBody::bytes(encode_json(&value, diagnostics), Some("application/json"))
         }
         Some(Body::Text(text)) => {
             let text = resolve_text(resolver, text, diagnostics).unwrap_or_else(|| text.clone());
-            (
-                Some(Bytes::from(text)),
-                Some("text/plain; charset=utf-8".to_string()),
-            )
+            PreparedBody::bytes(Some(Bytes::from(text)), Some("text/plain; charset=utf-8"))
         }
-        Some(Body::Form(fields)) => (
+        Some(Body::Form(fields)) => PreparedBody::bytes(
             Some(Bytes::from(encode_form(fields, resolver, diagnostics))),
-            Some("application/x-www-form-urlencoded".to_string()),
+            Some("application/x-www-form-urlencoded"),
         ),
-        Some(Body::Multipart(_) | Body::RawFile(_)) => {
+        Some(Body::Multipart(fields)) => {
+            let plan = prepare_rest_multipart(ctx, resolver, fields, diagnostics);
+            PreparedBody::multipart(plan)
+        }
+        Some(Body::RawFile(text)) => prepare_raw_file(ctx, resolver, text, diagnostics),
+    };
+
+    (method, url, prepared)
+}
+
+/// Assemble a REST `kind: multipart` body: text fields from the flat map plus
+/// file parts keyed by field name, on one request (§7.14).
+fn prepare_rest_multipart(
+    ctx: &RunContext,
+    resolver: &Resolver<'_>,
+    fields: &BTreeMap<String, String>,
+    diagnostics: &mut Diagnostics,
+) -> MultipartPlan {
+    let mut text: BTreeMap<String, String> = BTreeMap::new();
+    let mut files: Vec<FilePart> = Vec::new();
+
+    for (name, value) in fields {
+        let Some(spec_name) = whole_file_ref(value) else {
+            if let Some(resolved) = resolve_text(resolver, value, diagnostics) {
+                text.insert(name.clone(), resolved);
+            }
+            continue;
+        };
+        let Some(spec) = resolver.files.get(&spec_name) else {
+            continue;
+        };
+        if spec.encoding == FileEncoding::Base64 {
             diagnostics.push(Diagnostic {
                 code: codes::E_WRONG_TYPE,
                 severity: Severity::Error,
                 file: None,
                 span: None,
-                path: None,
-                message: "this body kind is not implemented yet".to_string(),
-                hint: Some("multipart and raw-file uploads arrive with Task 19".to_string()),
+                path: Some(format!("request.body.value.{name}")),
+                message: format!(
+                    "`{value}` is base64-encoded, but a multipart field has no JSON position to inline it"
+                ),
+                hint: Some(
+                    "use encoding: multipart, or move the file into a JSON body".to_string(),
+                ),
             });
-            (None, None)
+            continue;
         }
-    };
+        let label = format!("files.{spec_name}");
+        if let Some(file) = load_file(ctx, spec, &label, diagnostics) {
+            files.push(FilePart {
+                path: name.clone(),
+                bytes: file.bytes,
+                mime: file.mime,
+                filename: file.filename,
+            });
+        }
+    }
 
-    (method, url, body, content_type)
+    // A file declared in the block but not named by the body map is still
+    // uploaded, keyed by its own name — that is the field name in the common
+    // case (`files: {avatar: …}` sends field `avatar`).
+    for (name, spec) in resolver.files {
+        if files.iter().any(|part| &part.path == name) || text.contains_key(name) {
+            continue;
+        }
+        if spec.encoding == FileEncoding::Base64 {
+            diagnostics.push(Diagnostic {
+                code: codes::E_WRONG_TYPE,
+                severity: Severity::Error,
+                file: None,
+                span: None,
+                path: Some(format!("files.{name}")),
+                message: "a base64 file has no JSON position in a multipart body".to_string(),
+                hint: Some(
+                    "use encoding: multipart, or move the file into a JSON body".to_string(),
+                ),
+            });
+            continue;
+        }
+        let label = format!("files.{name}");
+        if let Some(file) = load_file(ctx, spec, &label, diagnostics) {
+            files.push(FilePart {
+                path: name.clone(),
+                bytes: file.bytes,
+                mime: file.mime,
+                filename: file.filename,
+            });
+        }
+    }
+
+    MultipartPlan::Rest {
+        fields: text,
+        files,
+    }
+}
+
+/// A `rawFile` body: the whole body is the file's bytes, `Content-Type` is the
+/// declared or sniffed MIME type, and no filename is sent (§7.14).
+fn prepare_raw_file(
+    ctx: &RunContext,
+    resolver: &Resolver<'_>,
+    text: &str,
+    diagnostics: &mut Diagnostics,
+) -> PreparedBody {
+    let label = "request.body.value";
+
+    // A whole `{{file.x}}` reference names a spec in the block, so a declared
+    // MIME type survives; any other expression resolves to a path.
+    if let Some(spec_name) = whole_file_ref(text) {
+        let Some(spec) = resolver.files.get(&spec_name) else {
+            return PreparedBody::bytes(None, None);
+        };
+        return match load_file(ctx, spec, label, diagnostics) {
+            Some(file) => PreparedBody::bytes(Some(file.bytes), Some(&file.mime)),
+            None => PreparedBody::bytes(None, None),
+        };
+    }
+
+    let Some(path) = resolve_text(resolver, text, diagnostics) else {
+        return PreparedBody::bytes(None, None);
+    };
+    let spec = FileSpec {
+        path,
+        mime_type: None,
+        filename: None,
+        encoding: FileEncoding::Multipart,
+    };
+    match load_file(ctx, &spec, label, diagnostics) {
+        Some(file) => PreparedBody::bytes(Some(file.bytes), Some(&file.mime)),
+        None => PreparedBody::bytes(None, None),
+    }
+}
+
+/// Load one file through the run's cache, reporting a diagnostic under `path`.
+fn load_file(
+    ctx: &RunContext,
+    spec: &FileSpec,
+    path: &str,
+    diagnostics: &mut Diagnostics,
+) -> Option<LoadedFile> {
+    let mut cache = ctx
+        .files
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    match cache.load(spec) {
+        Ok(file) => Some(file),
+        Err(mut diagnostic) => {
+            diagnostic.path = Some(path.to_string());
+            diagnostics.push(diagnostic);
+            None
+        }
+    }
+}
+
+/// Replace every whole `{{file.x}}` string in a JSON body with the file's
+/// base64 text, and refuse a multipart file where no part can be built.
+fn inline_base64_files(
+    ctx: &RunContext,
+    resolver: &Resolver<'_>,
+    value: &mut Value,
+    path: &str,
+    diagnostics: &mut Diagnostics,
+) {
+    match value {
+        Value::String(text) => {
+            let Some(spec_name) = whole_file_ref(text) else {
+                return;
+            };
+            let Some(spec) = resolver.files.get(&spec_name) else {
+                return;
+            };
+            if spec.encoding != FileEncoding::Base64 {
+                diagnostics.push(Diagnostic {
+                    code: codes::E_WRONG_TYPE,
+                    severity: Severity::Error,
+                    file: None,
+                    span: None,
+                    path: Some(path.to_string()),
+                    message: format!(
+                        "`{text}` is a multipart file, but a JSON body has no multipart part to put it in"
+                    ),
+                    hint: Some("use encoding: base64 to inline the file, or a multipart body".to_string()),
+                });
+                return;
+            }
+            let label = format!("files.{spec_name}");
+            if let Some(file) = load_file(ctx, spec, &label, diagnostics) {
+                *value = Value::String(STANDARD.encode(&file.bytes));
+            }
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter_mut().enumerate() {
+                let child = crate::template::value::join_path(path, &index.to_string());
+                inline_base64_files(ctx, resolver, item, &child, diagnostics);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                let child = crate::template::value::join_path(path, key);
+                inline_base64_files(ctx, resolver, item, &child, diagnostics);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The name of a whole-value `{{file.x}}` reference, if `text` is exactly one.
+///
+/// A whole-value file reference resolves to its own token text (Task 10), which
+/// is what lets this task tell a file position from ordinary text.
+fn whole_file_ref(text: &str) -> Option<String> {
+    let segments = scan(text).ok()?;
+    match segments.as_slice() {
+        [Segment::Token { inner, .. }] => match parse_token(inner).ok()? {
+            Token::File(name) => Some(name),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Parse an HTTP method, defaulting to GET so the diagnostic is the report.
@@ -594,10 +868,16 @@ fn build_wire_request(
 ) -> Result<reqwest::Request, (TransportKind, String)> {
     let mut builder = client.request(request.method.clone(), request.url.clone());
 
+    // A multipart body owns its `Content-Type`, boundary included: a header
+    // copied in here would replace it and produce an unparseable body (§7.6).
+    let multipart = request.multipart.is_some();
     let mut content_type_set = false;
     for (name, value) in &request.headers {
         if name.eq_ignore_ascii_case("content-type") {
             content_type_set = true;
+            if multipart {
+                continue;
+            }
         }
         builder = builder.header(name.as_str(), value.as_str());
     }
@@ -606,6 +886,9 @@ fn build_wire_request(
     {
         builder = builder.header(CONTENT_TYPE, content_type.as_str());
     }
+    if let Some(plan) = &request.multipart {
+        builder = builder.multipart(form_for(plan));
+    }
     if let Some(body) = &request.body {
         builder = builder.body(body.clone());
     }
@@ -613,6 +896,24 @@ fn build_wire_request(
     builder
         .build()
         .map_err(|error| (TransportKind::Other, error.to_string()))
+}
+
+/// Assemble the multipart form for one attempt, boundary included.
+fn form_for(plan: &MultipartPlan) -> reqwest::multipart::Form {
+    match plan {
+        MultipartPlan::Graphql { body, files } => {
+            let tuples: Vec<_> = files.iter().map(FilePart::as_tuple).collect();
+            build_graphql_multipart(body, &tuples)
+        }
+        MultipartPlan::Rest { fields, files } => {
+            let tuples: Vec<_> = files.iter().map(FilePart::as_tuple).collect();
+            let mut form = build_rest_multipart(&tuples);
+            for (name, value) in fields {
+                form = form.text(name.clone(), value.clone());
+            }
+            form
+        }
+    }
 }
 
 /// The response headers in wire order.

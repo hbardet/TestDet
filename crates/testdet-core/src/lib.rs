@@ -12,6 +12,7 @@ pub mod context;
 pub mod diagnostic;
 pub mod engine;
 pub mod events;
+pub mod files;
 pub mod operation;
 pub mod outcome;
 pub mod redact;
@@ -20,8 +21,10 @@ pub mod session;
 pub mod template;
 
 pub use context::RunContext;
+pub use engine::multipart::{build_graphql_multipart, build_rest_multipart};
 pub use engine::{EnvelopeShape, PreparedRequest, execute, prepare, read_envelope};
 pub use events::{Event, EventSink};
+pub use files::{FileCache, LoadedFile, check_path, sniff_mime};
 pub use outcome::{
     CookieInfo, GraphQLError, Outcome, RequestEcho, Timing, TransportError, TransportKind,
 };

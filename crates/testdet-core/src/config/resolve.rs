@@ -45,6 +45,11 @@ pub struct Resolved {
     pub timeout: Duration,
     pub retries: u32,
 
+    /// The directory that holds `testdet/testdet.yaml`. Relative file paths
+    /// in a `files:` block resolve against it (§7.14), so the file cache in a
+    /// [`crate::RunContext`] needs it too.
+    pub root_dir: PathBuf,
+
     /// Manifest defaults + environment headers (no user), the first two layers
     /// `headers_for` restarts from.
     base_headers: HeaderMap,
@@ -159,6 +164,7 @@ pub fn resolve(
         secrets,
         timeout,
         retries,
+        root_dir: config.root_dir.clone(),
         base_headers,
         env_vars,
         cli_vars: cli,

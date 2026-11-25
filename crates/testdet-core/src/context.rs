@@ -6,13 +6,14 @@
 //! cancel token" seam of §7.3: one value the engine and every frontend can
 //! construct and pass around.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Resolved;
 use crate::events::{Event, EventSink};
+use crate::files::FileCache;
 use crate::redact::Redactor;
 
 /// The immutable inputs and shared handles for one run.
@@ -29,6 +30,10 @@ pub struct RunContext {
     pub redactor: Arc<Redactor>,
     pub cancel: CancellationToken,
     pub events: Option<EventSink>,
+    /// The run's file cache: one read per file, shared by every clone of this
+    /// context, so a file referenced by five requests is read once (§7.14).
+    /// A `Mutex` because `prepare` only ever has `&RunContext`.
+    pub files: Arc<Mutex<FileCache>>,
 }
 
 impl RunContext {
@@ -36,6 +41,7 @@ impl RunContext {
     /// [`Resolved`], a fresh cancellation token, and no event sink.
     #[must_use]
     pub fn new(resolved: Arc<Resolved>, redactor: Arc<Redactor>) -> Self {
+        let files = FileCache::new(&resolved.root_dir);
         Self {
             timeout: resolved.timeout,
             resolved,
@@ -44,6 +50,7 @@ impl RunContext {
             redactor,
             cancel: CancellationToken::new(),
             events: None,
+            files: Arc::new(Mutex::new(files)),
         }
     }
 
