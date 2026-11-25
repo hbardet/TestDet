@@ -453,7 +453,7 @@ fn known_ids(id: &str, config: &Config) -> String {
 }
 
 /// The usage diagnostic for an unknown `--user`, listing the declared users.
-fn unknown_user(user: &str, config: &Config) -> Diagnostics {
+pub(crate) fn unknown_user(user: &str, config: &Config) -> Diagnostics {
     let hint = if config.users.is_empty() {
         "the config declares no users; omit `--user` to run anonymously".to_string()
     } else {

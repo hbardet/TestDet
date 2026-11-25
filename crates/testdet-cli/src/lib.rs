@@ -6,13 +6,14 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::commands::{config, env, run, show, validate};
+use crate::commands::{config, env, run, show, tui, validate};
 use crate::exit::Exit;
 use crate::format::Format;
 
 pub mod commands;
 pub mod exit;
 pub mod format;
+pub mod tui_driver;
 
 #[derive(Parser)]
 #[command(
@@ -28,7 +29,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Explore collections and operations in a terminal UI.
-    Tui,
+    Tui(TuiCli),
     /// Validate the testdet/ config directory.
     Validate(ValidateCli),
     /// Run operations end to end: one user, sequential, worst exit code.
@@ -53,6 +54,19 @@ struct ValidateCli {
     format: Format,
     /// Environment override; selects the secrets declaration file
     /// (`testdet/secrets/<env>.yaml`).
+    #[arg(long)]
+    env: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct TuiCli {
+    /// Explicit config path; otherwise discovered by walking up from the cwd.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// The user to start as; `u` cycles identities in the UI.
+    #[arg(long)]
+    user: Option<String>,
+    /// Environment to resolve; `e` cycles environments in the UI.
     #[arg(long)]
     env: Option<String>,
 }
@@ -257,7 +271,17 @@ pub fn run(argv: Vec<OsString>) -> u8 {
             let _ = format;
             emit(exit, &output, produced_outcomes)
         }
-        Commands::Tui | Commands::Schema => {
+        Commands::Tui(args) => {
+            let (exit, output) = tui::run(tui::TuiArgs {
+                config: args.config,
+                user: args.user,
+                env: args.env,
+            });
+            // A normal quit has nothing to print; an error is diagnostics,
+            // which go to stderr once the terminal is back to normal (F10).
+            emit(exit, &output, false)
+        }
+        Commands::Schema => {
             eprintln!("not implemented");
             4
         }

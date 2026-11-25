@@ -9,6 +9,7 @@ pub mod config;
 pub mod env;
 pub mod run;
 pub mod show;
+pub mod tui;
 pub mod validate;
 
 /// The usage error returned when `--format ndjson` is passed to a command
