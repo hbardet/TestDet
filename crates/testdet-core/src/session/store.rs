@@ -255,6 +255,16 @@ impl SessionStore {
         }
     }
 
+    /// Replace the session-scoped variable overrides the next run resolves
+    /// against (§7.16, §7.19).
+    ///
+    /// The TUI calls this before each run with the values stored with `s`, so
+    /// they are the top layer of variable resolution. They live in this
+    /// store's context only: nothing is persisted.
+    pub fn set_var_overrides(&mut self, var_overrides: BTreeMap<String, Value>) {
+        self.ctx.var_overrides = var_overrides;
+    }
+
     /// Replace the store's cancellation token with a fresh one and return it.
     ///
     /// The sessions are untouched: cookies, captured variables and default

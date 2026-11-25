@@ -2507,6 +2507,7 @@ dependencies = [
  "testdet-tui",
  "tokio",
  "tokio-util",
+ "wiremock",
 ]
 
 [[package]]

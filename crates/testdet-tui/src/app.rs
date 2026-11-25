@@ -281,6 +281,16 @@ impl App {
         &self.vars
     }
 
+    /// Store one variable, as `s` does for a whole response (§7.16).
+    ///
+    /// [`App::store_selection`] stores every field of the last response; this
+    /// is the single-value form. It exists so a host — or a test driving the
+    /// real driver — can put a value in the session store before any response
+    /// has arrived. The value stays in memory: nothing here is persisted.
+    pub fn store_var(&mut self, name: &str, value: Value, source: impl Into<String>) {
+        self.vars.store(name, value, source.into());
+    }
+
     /// The variable map a run of `operation` would use: the resolved stack
     /// (operation → env → user → `--var`) with the stored values layered on
     /// top, so a stored value always wins (§7.19).

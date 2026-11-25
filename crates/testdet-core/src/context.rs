@@ -6,10 +6,13 @@
 //! cancel token" seam of §7.3: one value the engine and every frontend can
 //! construct and pass around.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
+
+use serde_json::Value;
 
 use crate::config::Resolved;
 use crate::events::{Event, EventSink};
@@ -30,6 +33,11 @@ pub struct RunContext {
     pub redactor: Arc<Redactor>,
     pub cancel: CancellationToken,
     pub events: Option<EventSink>,
+    /// Session-scoped variable overrides, the top layer of variable resolution
+    /// (§7.16, §7.19). The TUI puts the values stored with `s` here; they win
+    /// over operation, environment, user and `--var` values and are never
+    /// written anywhere.
+    pub var_overrides: BTreeMap<String, Value>,
     /// The run's file cache: one read per file, shared by every clone of this
     /// context, so a file referenced by five requests is read once (§7.14).
     /// A `Mutex` because `prepare` only ever has `&RunContext`.
@@ -50,6 +58,7 @@ impl RunContext {
             redactor,
             cancel: CancellationToken::new(),
             events: None,
+            var_overrides: BTreeMap::new(),
             files: Arc::new(Mutex::new(files)),
         }
     }
@@ -72,6 +81,17 @@ impl RunContext {
     #[must_use]
     pub fn with_events(mut self, events: Option<EventSink>) -> Self {
         self.events = events;
+        self
+    }
+
+    /// Set the session-scoped variable overrides (§7.16, §7.19).
+    ///
+    /// These are the values a frontend stored from a response; they are merged
+    /// above every layer [`Resolved::vars_for`] produces, so a stored value
+    /// always wins.
+    #[must_use]
+    pub fn with_var_overrides(mut self, var_overrides: BTreeMap<String, Value>) -> Self {
+        self.var_overrides = var_overrides;
         self
     }
 

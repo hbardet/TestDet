@@ -14,3 +14,4 @@ tokio-util = { version = "0.7", features = ["rt"] }
 [dev-dependencies]
 insta = { version = "1", features = ["filters"] }
 tempfile = "3"
+wiremock = "0.6"

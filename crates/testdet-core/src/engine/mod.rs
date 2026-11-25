@@ -124,7 +124,12 @@ pub(crate) fn prepare_with_session(
     session_headers: &[(String, String)],
 ) -> Result<PreparedRequest, Diagnostics> {
     let resolved = &ctx.resolved;
-    let vars = resolved.vars_for(operation, ctx.user.as_deref());
+    let mut vars = resolved.vars_for(operation, ctx.user.as_deref());
+    // Session-scoped overrides are the top layer (§7.16, §7.19): a value stored
+    // in the TUI beats the operation, env, user and `--var` layers.
+    for (name, value) in &ctx.var_overrides {
+        vars.insert(name.clone(), value.clone());
+    }
     // `Resolved::secrets.file` is already joined against the config root, so
     // an empty root leaves it exactly as resolution computed it.
     let env = build_source(&resolved.secrets, Path::new(""));

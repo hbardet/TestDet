@@ -17,6 +17,7 @@
 //! * **switching environment** (§7.16) discards the session: cookies belong to
 //!   an environment, so a new store is the correct outcome there.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 
@@ -24,6 +25,7 @@ use testdet_core::config::{LoadOptions, Resolved, load_config, resolve};
 use testdet_core::diagnostic::render_text;
 use testdet_core::diagnostic::{Diagnostic, Severity, codes};
 use testdet_core::redact::{Redactor, redactor_for};
+use testdet_core::serde_json::Value;
 use testdet_core::session::{SessionStore, execute_for_user};
 use testdet_core::{Event, EventSink, RunContext};
 use testdet_tui::Driver;
@@ -35,10 +37,12 @@ use tokio_util::sync::CancellationToken;
 /// No `Debug`: the switch carries a `Redactor`, which deliberately does not
 /// print its patterns.
 enum Command {
-    /// Run `operation` as `user` (`None` is anonymous).
+    /// Run `operation` as `user` (`None` is anonymous), with the values stored
+    /// in the UI this session as the top variable layer (§7.16).
     Start {
         operation: String,
         user: Option<String>,
+        vars: BTreeMap<String, Value>,
     },
     /// Adopt a re-resolved environment and start a fresh session store.
     Switch {
@@ -95,11 +99,12 @@ impl ExecutorDriver {
 }
 
 impl Driver for ExecutorDriver {
-    fn start(&mut self, operation: &str, user: Option<&str>) {
+    fn start(&mut self, operation: &str, user: Option<&str>, vars: &BTreeMap<String, Value>) {
         if let Some(commands) = &self.commands {
             let _ = commands.send(Command::Start {
                 operation: operation.to_string(),
                 user: user.map(str::to_string),
+                vars: vars.clone(),
             });
         }
     }
@@ -209,10 +214,17 @@ fn run_worker(
 
     while let Ok(command) = commands.recv() {
         match command {
-            Command::Start { operation, user } => {
+            Command::Start {
+                operation,
+                user,
+                vars,
+            } => {
                 let Some(operation) = resolved.operations.get(&operation) else {
                     continue;
                 };
+                // The stored values are per session and in memory only: they
+                // land in the store's context, never on disk (§7.16).
+                store.set_var_overrides(vars);
                 runtime.block_on(execute_for_user(&mut store, user.as_deref(), operation));
                 if lock(&seed.token).is_cancelled() {
                     // C1: re-arm the token in place. Rebuilding the store here

@@ -520,7 +520,13 @@ struct SwitchDriver {
 }
 
 impl Driver for SwitchDriver {
-    fn start(&mut self, _operation: &str, _user: Option<&str>) {}
+    fn start(
+        &mut self,
+        _operation: &str,
+        _user: Option<&str>,
+        _vars: &std::collections::BTreeMap<String, testdet_core::serde_json::Value>,
+    ) {
+    }
 
     fn cancel(&mut self) {}
 

@@ -17,6 +17,7 @@ mod test_support;
 mod tree;
 mod var_store;
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -31,6 +32,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use testdet_core::Event;
 use testdet_core::config::Resolved;
+use testdet_core::serde_json::Value;
 
 pub use crate::app::{Action, App};
 pub use crate::body_view::BodyView;
@@ -46,7 +48,13 @@ const POLL: Duration = Duration::from_millis(50);
 /// keep the frame responsive while a request is in flight.
 pub trait Driver {
     /// Start `operation`, as `user` (`None` is anonymous).
-    fn start(&mut self, operation: &str, user: Option<&str>);
+    ///
+    /// `vars` are the values stored in this session with `s` (§7.16). They are
+    /// the top layer of variable resolution — above operation, environment,
+    /// user and `--var` values (§7.19) — so a driver must resolve the request's
+    /// templates against them; [`App::vars`] supplies them, and an empty map
+    /// means nothing was stored.
+    fn start(&mut self, operation: &str, user: Option<&str>, vars: &BTreeMap<String, Value>);
     /// Cancel the in-flight run, if any.
     fn cancel(&mut self);
     /// Re-resolve `environment` and make the driver's own state match it.
@@ -171,7 +179,10 @@ fn event_loop(
 pub fn dispatch(app: &mut App, action: Action, driver: &mut dyn Driver) -> Result<bool, TuiError> {
     match action {
         Action::Quit => return Ok(false),
-        Action::Run(operation) => driver.start(&operation, app.user()),
+        Action::Run(operation) => {
+            let vars = app.vars().as_overrides();
+            driver.start(&operation, app.user(), &vars);
+        }
         Action::Cancel => driver.cancel(),
         // The host owns config resolution, so it owns the switch: it re-loads
         // the environment's config, resolves it, and hands the result back.
@@ -190,15 +201,18 @@ mod tests {
 
     #[derive(Default)]
     struct FakeDriver {
-        started: Vec<(String, Option<String>)>,
+        started: Vec<(String, Option<String>, BTreeMap<String, Value>)>,
         cancelled: usize,
         pending: Vec<Event>,
     }
 
     impl Driver for FakeDriver {
-        fn start(&mut self, operation: &str, user: Option<&str>) {
-            self.started
-                .push((operation.to_string(), user.map(str::to_string)));
+        fn start(&mut self, operation: &str, user: Option<&str>, vars: &BTreeMap<String, Value>) {
+            self.started.push((
+                operation.to_string(),
+                user.map(str::to_string),
+                vars.clone(),
+            ));
         }
 
         fn cancel(&mut self) {
@@ -231,7 +245,10 @@ mod tests {
         assert!(dispatch(&mut app, Action::Cancel, &mut driver).unwrap());
         assert!(!dispatch(&mut app, Action::Quit, &mut driver).unwrap());
 
-        assert_eq!(driver.started, vec![("listProducts".to_string(), None)]);
+        assert_eq!(
+            driver.started,
+            vec![("listProducts".to_string(), None, BTreeMap::new())]
+        );
         assert_eq!(driver.cancelled, 1);
     }
 
