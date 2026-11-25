@@ -1,0 +1,7 @@
+---
+source: crates/testdet-cli/tests/validate_cli.rs
+expression: output
+---
+<root>/testdet/users/upload.yaml:13:3
+  files.extra
+W_UNUSED_VAR  file `extra` is declared but never referenced

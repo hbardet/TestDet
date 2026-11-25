@@ -1,0 +1,11 @@
+id: upload
+request:
+  kind: http
+  method: POST
+  path: /upload
+  body:
+    kind: multipart
+    value:
+      a: x
+  headers:
+    Content-Type: multipart/form-data

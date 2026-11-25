@@ -1,0 +1,881 @@
+//! Integration tests for per-user sessions (Task 17, spec §7.7).
+//!
+//! Every test drives the real `SessionStore`/`execute_for_user` path against a
+//! wiremock server, so the cookies and the login requests asserted here are the
+//! ones that reached the wire.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use serde_json::{Value, json};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+use testdet_core::config::discover::Config;
+use testdet_core::config::model::Manifest;
+use testdet_core::config::resolve::{Resolved, resolve};
+use testdet_core::diagnostic::{Diagnostic, codes};
+use testdet_core::operation::model::Operation;
+use testdet_core::redact::Redactor;
+use testdet_core::session::{
+    SessionStore, execute_for_user, is_auth_failure, resolve_capture_path,
+};
+use testdet_core::{EnvelopeShape, Event, RunContext};
+
+/// A resolved environment pointing at `base_url`, with `users`, `operations`
+/// and an optional `defaultLogin`.
+fn resolved_for(
+    base_url: &str,
+    users: Value,
+    operations: Vec<Operation>,
+    default_login: Option<&str>,
+) -> Arc<Resolved> {
+    let manifest: Manifest = serde_json::from_value(json!({
+        "version": 1,
+        "collections": [],
+        "graphqlPath": "/graphql",
+        "environments": { "test": { "baseUrl": base_url } },
+        "defaultEnvironment": "test"
+    }))
+    .expect("fixture manifest is valid");
+
+    let mut by_id = BTreeMap::new();
+    for operation in operations {
+        by_id.insert(operation.id.clone(), operation);
+    }
+
+    let config = Config {
+        manifest,
+        root_dir: PathBuf::from("/tmp/testdet"),
+        operations: by_id,
+        users: serde_json::from_value(users).expect("fixture users are valid"),
+        secrets: None,
+        secrets_env: "test".to_string(),
+        default_login: default_login.map(str::to_string),
+        operation_files: BTreeMap::new(),
+        documents: BTreeMap::new(),
+    };
+
+    Arc::new(resolve(&config, None, &[]).expect("fixture config resolves"))
+}
+
+fn operation(value: Value) -> Operation {
+    serde_json::from_value(value).expect("operation fixture is valid")
+}
+
+fn login_op(id: &str, endpoint: &str) -> Operation {
+    operation(json!({
+        "id": id,
+        "request": { "kind": "http", "method": "POST", "path": endpoint }
+    }))
+}
+
+fn login_op_capturing(id: &str, endpoint: &str) -> Operation {
+    operation(json!({
+        "id": id,
+        "request": { "kind": "http", "method": "POST", "path": endpoint },
+        "capture": { "token": "data.login.token" }
+    }))
+}
+
+fn http_op(id: &str, endpoint: &str) -> Operation {
+    operation(json!({
+        "id": id,
+        "request": { "kind": "http", "method": "POST", "path": endpoint }
+    }))
+}
+
+fn graphql_op(id: &str) -> Operation {
+    operation(json!({
+        "id": id,
+        "request": { "kind": "graphql", "query": "query { me { id } }" }
+    }))
+}
+
+fn session_token_op(id: &str, endpoint: &str) -> Operation {
+    operation(json!({
+        "id": id,
+        "request": {
+            "kind": "http",
+            "method": "GET",
+            "path": endpoint,
+            "headers": { "Authorization": "Bearer {{session.token}}" }
+        }
+    }))
+}
+
+fn two_users() -> Value {
+    json!({
+        "alice": { "credentials": { "email": "alice@example.test" }, "login": "loginA" },
+        "admin": { "credentials": { "email": "admin@example.test" }, "login": "loginB" }
+    })
+}
+
+fn store(resolved: Arc<Resolved>, redactor: Arc<Redactor>) -> SessionStore {
+    SessionStore::new(RunContext::new(resolved, redactor))
+}
+
+async fn requests_to(server: &MockServer, endpoint: &str) -> Vec<Request> {
+    server
+        .received_requests()
+        .await
+        .expect("mock server records requests")
+        .into_iter()
+        .filter(|request| request.url.path() == endpoint)
+        .collect()
+}
+
+async fn count_to(server: &MockServer, endpoint: &str) -> usize {
+    requests_to(server, endpoint).await.len()
+}
+
+async fn last_header(server: &MockServer, endpoint: &str, name: &str) -> Option<String> {
+    requests_to(server, endpoint)
+        .await
+        .last()
+        .and_then(|request| request.headers.get(name))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+/// A responder that answers 401 the first time and 200 afterwards, so a
+/// re-login is observable without depending on mock ordering.
+#[derive(Default)]
+struct FirstUnauthorized {
+    calls: AtomicUsize,
+}
+
+impl Respond for FirstUnauthorized {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            ResponseTemplate::new(401)
+        } else {
+            ResponseTemplate::new(200).set_body_json(json!({ "ok": true }))
+        }
+    }
+}
+
+#[tokio::test]
+async fn two_users_hold_separate_cookie_jars() {
+    let server = MockServer::start().await;
+    for (endpoint, cookie) in [("/login/a", "sid=alice"), ("/login/b", "sid=admin")] {
+        Mock::given(method("POST"))
+            .and(path(endpoint))
+            .respond_with(
+                ResponseTemplate::new(200).insert_header("Set-Cookie", format!("{cookie}; Path=/")),
+            )
+            .mount(&server)
+            .await;
+    }
+    for endpoint in ["/echo/a", "/echo/b"] {
+        Mock::given(method("POST"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+            .mount(&server)
+            .await;
+    }
+
+    let resolved = resolved_for(
+        &server.uri(),
+        two_users(),
+        vec![
+            login_op("loginA", "/login/a"),
+            login_op("loginB", "/login/b"),
+            http_op("echoA", "/echo/a"),
+            http_op("echoB", "/echo/b"),
+        ],
+        None,
+    );
+    let mut store = store(resolved, Arc::new(Redactor::new()));
+
+    let echo_a = http_op("echoA", "/echo/a");
+    let echo_b = http_op("echoB", "/echo/b");
+
+    assert_eq!(
+        execute_for_user(&mut store, Some("alice"), &echo_a)
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        execute_for_user(&mut store, Some("admin"), &echo_b)
+            .await
+            .status,
+        200
+    );
+
+    assert_eq!(
+        last_header(&server, "/echo/a", "cookie").await.as_deref(),
+        Some("sid=alice")
+    );
+    assert_eq!(
+        last_header(&server, "/echo/b", "cookie").await.as_deref(),
+        Some("sid=admin")
+    );
+}
+
+#[tokio::test]
+async fn switching_back_to_a_cached_user_logs_in_once() {
+    let server = MockServer::start().await;
+    for endpoint in ["/login/a", "/login/b", "/echo/a", "/echo/b"] {
+        Mock::given(method("POST"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+            .mount(&server)
+            .await;
+    }
+
+    let resolved = resolved_for(
+        &server.uri(),
+        two_users(),
+        vec![
+            login_op("loginA", "/login/a"),
+            login_op("loginB", "/login/b"),
+            http_op("echoA", "/echo/a"),
+            http_op("echoB", "/echo/b"),
+        ],
+        None,
+    );
+    let mut store = store(resolved, Arc::new(Redactor::new()));
+
+    let echo_a = http_op("echoA", "/echo/a");
+    let echo_b = http_op("echoB", "/echo/b");
+
+    execute_for_user(&mut store, Some("alice"), &echo_a).await;
+    execute_for_user(&mut store, Some("admin"), &echo_b).await;
+    execute_for_user(&mut store, Some("alice"), &echo_a).await;
+
+    assert_eq!(count_to(&server, "/login/a").await, 1);
+    assert_eq!(count_to(&server, "/login/b").await, 1);
+    assert_eq!(count_to(&server, "/echo/a").await, 2);
+}
+
+#[tokio::test]
+async fn exactly_one_relogin_happens_after_a_401() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login/a"))
+        .respond_with(ResponseTemplate::new(200).insert_header("Set-Cookie", "sid=alice-1; Path=/"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/protected"))
+        .respond_with(FirstUnauthorized::default())
+        .mount(&server)
+        .await;
+
+    let resolved = resolved_for(
+        &server.uri(),
+        two_users(),
+        vec![
+            login_op("loginA", "/login/a"),
+            http_op("protected", "/protected"),
+        ],
+        None,
+    );
+    let mut store = store(resolved, Arc::new(Redactor::new()));
+
+    let outcome = execute_for_user(
+        &mut store,
+        Some("alice"),
+        &http_op("protected", "/protected"),
+    )
+    .await;
+
+    assert_eq!(outcome.status, 200);
+    assert_eq!(count_to(&server, "/login/a").await, 2);
+    assert_eq!(count_to(&server, "/protected").await, 2);
+}
+
+#[tokio::test]
+async fn a_failing_login_is_never_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login/a"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/protected"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let resolved = resolved_for(
+        &server.uri(),
+        two_users(),
+        vec![
+            login_op("loginA", "/login/a"),
+            http_op("protected", "/protected"),
+        ],
+        None,
+    );
+    let mut store = store(resolved, Arc::new(Redactor::new()));
+
+    let outcome = execute_for_user(
+        &mut store,
+        Some("alice"),
+        &http_op("protected", "/protected"),
+    )
+    .await;
+
+    assert_eq!(count_to(&server, "/login/a").await, 1);
+    assert_eq!(count_to(&server, "/protected").await, 0);
+    assert_eq!(outcome.status, 0);
+    let error = outcome.transport_error.expect("login failure recorded");
+    assert!(error.message.contains("alice"), "{}", error.message);
+    assert!(error.message.contains("loginA"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn graphql_unauthenticated_is_detected_at_status_200() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login/a"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": null,
+            "errors": [
+                { "message": "who are you?", "extensions": { "code": "UNAUTHENTICATED" } }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let resolved = resolved_for(
+        &server.uri(),
+        two_users(),
+        vec![login_op("loginA", "/login/a"), graphql_op("me")],
+        None,
+    );
+    let mut store = store(resolved, Arc::new(Redactor::new()));
+
+    let outcome = execute_for_user(&mut store, Some("alice"), &graphql_op("me")).await;
+
+    assert_eq!(outcome.status, 200);
+    assert!(is_auth_failure(&outcome));
+    assert_eq!(count_to(&server, "/graphql").await, 2);
+    assert_eq!(count_to(&server, "/login/a").await, 2);
+}
+
+#[tokio::test]
+async fn a_captured_token_is_registered_with_the_redactor_and_never_echoed() {
+    const TOKEN: &str = "tok-abc-123";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login/a"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "login": { "token": TOKEN } }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/protected"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&server)
+        .await;
+
+    let resolved = resolved_for(
+        &server.uri(),
+        two_users(),
+        vec![
+            login_op_capturing("loginA", "/login/a"),
+            session_token_op("protected", "/protected"),
+        ],
+        None,
+    );
+    let redactor = Arc::new(Redactor::new());
+    let mut store = store(resolved, redactor.clone());
+
+    let outcome = execute_for_user(
+        &mut store,
+        Some("alice"),
+        &session_token_op("protected", "/protected"),
+    )
+    .await;
+
+    // The token was captured, so the request carried it...
+    assert_eq!(
+        last_header(&server, "/protected", "authorization")
+            .await
+            .as_deref(),
+        Some("Bearer tok-abc-123")
+    );
+    // ...the echo shows it scrubbed...
+    assert_eq!(
+        outcome
+            .request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.as_str()),
+        Some("Bearer <CAPTURE_TOKEN>-CENSORED")
+    );
+    // ...and no representation of the outcome leaks it.
+    assert!(!serde_json::to_string(&outcome).unwrap().contains(TOKEN));
+    assert!(redactor.names().iter().any(|name| name == "CAPTURE_TOKEN"));
+}
+
+#[test]
+fn resolve_capture_path_supports_array_indices_and_reports_misses() {
+    let body = json!({ "data": { "users": [{ "id": "u1" }, { "id": "u2" }] } });
+
+    assert_eq!(
+        resolve_capture_path(&body, "data.users[0].id"),
+        Some(json!("u1"))
+    );
+    assert_eq!(
+        resolve_capture_path(&body, "data.users.1.id"),
+        Some(json!("u2"))
+    );
+    assert_eq!(resolve_capture_path(&body, "data.users[2].id"), None);
+    assert_eq!(resolve_capture_path(&body, "data.nope"), None);
+    assert_eq!(resolve_capture_path(&body, "data.users[0"), None);
+}
+
+#[tokio::test]
+async fn a_capture_miss_is_a_diagnostic_and_does_not_stop_other_captures() {
+    let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let resolved = resolved_for(
+        "http://127.0.0.1:1",
+        two_users(),
+        vec![login_op("loginA", "/login/a")],
+        None,
+    );
+    let ctx = RunContext::new(resolved, Arc::new(Redactor::new())).with_events(Some(sender));
+    let mut store = SessionStore::new(ctx);
+
+    let mut capture = BTreeMap::new();
+    capture.insert("userId".to_string(), "data.users[0].id".to_string());
+    capture.insert("missing".to_string(), "data.nope".to_string());
+
+    store.capture_into(
+        Some("alice"),
+        &capture,
+        br#"{"data":{"users":[{"id":"u1"}]}}"#,
+    );
+
+    assert_eq!(store.vars(Some("alice")).get("userId"), Some(&json!("u1")));
+
+    let mut codes = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let Event::Failed { diagnostic } = event {
+            codes.push((diagnostic.code, diagnostic.message));
+        }
+    }
+    assert_eq!(codes.len(), 1);
+    assert_eq!(codes[0].0, "E_UNRESOLVED_CAPTURE");
+    assert!(codes[0].1.contains("data.nope"), "{}", codes[0].1);
+}
+
+#[tokio::test]
+async fn an_operation_captures_its_own_response_for_later_requests() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login/a"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/whoami"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "data": { "me": { "id": "u-42" } } })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/later"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&server)
+        .await;
+
+    let whoami = operation(json!({
+        "id": "whoami",
+        "request": { "kind": "http", "method": "POST", "path": "/whoami" },
+        "capture": { "userId": "data.me.id" }
+    }));
+    let later = operation(json!({
+        "id": "later",
+        "request": {
+            "kind": "http",
+            "method": "GET",
+            "path": "/later",
+            "headers": { "X-User": "{{session.userId}}" }
+        }
+    }));
+
+    let resolved = resolved_for(
+        &server.uri(),
+        two_users(),
+        vec![
+            login_op("loginA", "/login/a"),
+            whoami.clone(),
+            later.clone(),
+        ],
+        None,
+    );
+    let mut store = store(resolved, Arc::new(Redactor::new()));
+
+    execute_for_user(&mut store, Some("alice"), &whoami).await;
+    assert_eq!(
+        store.vars(Some("alice")).get("userId"),
+        Some(&json!("u-42"))
+    );
+
+    execute_for_user(&mut store, Some("alice"), &later).await;
+    assert_eq!(
+        last_header(&server, "/later", "x-user").await.as_deref(),
+        Some("u-42")
+    );
+}
+
+#[tokio::test]
+async fn a_static_token_user_triggers_zero_auth_requests() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/protected"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "ok": true })))
+        .mount(&server)
+        .await;
+
+    let resolved = resolved_for(
+        &server.uri(),
+        json!({ "ci": { "token": "ci-token-123" } }),
+        vec![http_op("protected", "/protected")],
+        None,
+    );
+    let mut store = store(resolved, Arc::new(Redactor::new()));
+
+    let outcome =
+        execute_for_user(&mut store, Some("ci"), &http_op("protected", "/protected")).await;
+
+    assert_eq!(outcome.status, 200);
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server records requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer ci-token-123")
+    );
+}
+
+/// A login responder that hands out a different token on each call, so a
+/// re-login's captured value is distinguishable from the first one.
+#[derive(Default)]
+struct RotatingToken {
+    calls: AtomicUsize,
+}
+
+impl Respond for RotatingToken {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        ResponseTemplate::new(200).set_body_json(json!({ "token": format!("token-{call}-value") }))
+    }
+}
+
+#[tokio::test]
+async fn f2_a_captured_token_is_the_real_value_not_the_redacted_one() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login/a"))
+        .respond_with(RotatingToken::default())
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/protected"))
+        .respond_with(FirstUnauthorized::default())
+        .mount(&server)
+        .await;
+
+    let resolved = resolved_for(
+        &server.uri(),
+        two_users(),
+        vec![
+            operation(json!({
+                "id": "loginA",
+                "request": { "kind": "http", "method": "POST", "path": "/login/a" },
+                "capture": { "token": "token" }
+            })),
+            session_token_op("protected", "/protected"),
+        ],
+        None,
+    );
+    let mut store = store(resolved, Arc::new(Redactor::new()));
+
+    let outcome = execute_for_user(
+        &mut store,
+        Some("alice"),
+        &session_token_op("protected", "/protected"),
+    )
+    .await;
+    assert_eq!(outcome.status, 200);
+
+    // Capture runs on the raw body before redaction: the token sent on the
+    // wire is the server's value, never `<CAPTURE_TOKEN>-CENSORED` (F2).
+    let headers: Vec<Option<String>> = requests_to(&server, "/protected")
+        .await
+        .iter()
+        .map(|request| {
+            request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(
+        headers,
+        vec![
+            Some("Bearer token-1-value".to_string()),
+            Some("Bearer token-2-value".to_string()),
+        ],
+        "the first request and the post-relogin request both carry the real token"
+    );
+
+    let vars = format!("{:?}", store.vars(Some("alice")));
+    assert!(vars.contains("token-2-value"), "{vars}");
+    assert!(!vars.contains("-CENSORED"), "{vars}");
+}
+
+#[tokio::test]
+async fn f3_a_500_login_is_a_diagnostic_and_never_logs_in() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login/a"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/protected"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let resolved = resolved_for(
+        &server.uri(),
+        two_users(),
+        vec![
+            login_op("loginA", "/login/a"),
+            http_op("protected", "/protected"),
+        ],
+        None,
+    );
+    let mut store = store(resolved, Arc::new(Redactor::new()));
+
+    let diagnostic = store
+        .ensure(Some("alice"))
+        .await
+        .expect_err("a 500 login must not authenticate");
+    assert_eq!(diagnostic.code, codes::E_LOGIN_FAILED);
+    assert!(
+        diagnostic.message.contains("alice"),
+        "{}",
+        diagnostic.message
+    );
+    assert!(
+        diagnostic.message.contains("loginA"),
+        "{}",
+        diagnostic.message
+    );
+    assert!(diagnostic.message.contains("500"), "{}", diagnostic.message);
+    assert_eq!(count_to(&server, "/protected").await, 0);
+}
+
+#[tokio::test]
+async fn f3_a_graphql_errors_login_is_a_diagnostic_and_never_logs_in() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "errors": [{ "message": "bad credentials" }]
+        })))
+        .mount(&server)
+        .await;
+
+    let resolved = resolved_for(
+        &server.uri(),
+        two_users(),
+        vec![
+            operation(json!({
+                "id": "loginA",
+                "request": { "kind": "graphql", "query": "mutation { login }" }
+            })),
+            http_op("protected", "/protected"),
+        ],
+        None,
+    );
+    let mut store = store(resolved, Arc::new(Redactor::new()));
+
+    let diagnostic = store
+        .ensure(Some("alice"))
+        .await
+        .expect_err("a GraphQL-errors login must not authenticate");
+    assert_eq!(diagnostic.code, codes::E_LOGIN_FAILED);
+    assert!(
+        diagnostic.message.contains("bad credentials"),
+        "{}",
+        diagnostic.message
+    );
+}
+
+#[tokio::test]
+async fn f5_the_outcome_keeps_the_envelope_shape() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[1, 2, 3]"))
+        .mount(&server)
+        .await;
+
+    let resolved = resolved_for(&server.uri(), json!({}), vec![graphql_op("q")], None);
+    let mut store = store(resolved, Arc::new(Redactor::new()));
+
+    let outcome = execute_for_user(&mut store, None, &graphql_op("q")).await;
+    assert_eq!(outcome.shape, EnvelopeShape::NotAnObject);
+    assert!(outcome.graphql_errors.is_empty());
+}
+
+#[tokio::test]
+async fn f12_emitted_events_are_scrubbed_by_the_context() {
+    let redactor = Arc::new(Redactor::new());
+    redactor.register("LEAK", "top-secret-value");
+    let resolved = resolved_for("http://127.0.0.1:1", json!({}), vec![], None);
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let ctx = RunContext::new(resolved, redactor).with_events(Some(sender));
+
+    ctx.emit(Event::Failed {
+        diagnostic: Diagnostic {
+            code: codes::E_UNRESOLVED_REF,
+            severity: testdet_core::diagnostic::Severity::Error,
+            file: None,
+            span: None,
+            path: None,
+            message: "the header sent top-secret-value".to_string(),
+            hint: Some("hint mentions top-secret-value too".to_string()),
+        },
+    });
+
+    let event = receiver.recv().await.expect("the event arrives");
+    match event {
+        Event::Failed { diagnostic } => {
+            assert!(
+                !diagnostic.message.contains("top-secret-value"),
+                "{}",
+                diagnostic.message
+            );
+            let hint = diagnostic.hint.unwrap_or_default();
+            assert!(!hint.contains("top-secret-value"), "{hint}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+/// Cancelling one run must not log the user out (C1, §7.10).
+///
+/// A cancelled [`tokio_util::sync::CancellationToken`] stays cancelled, so a
+/// frontend that re-arms it has two choices: rebuild the context — dropping the
+/// cookie jar and the captures with it — or renew the token in place.
+/// [`SessionStore::renew_cancellation`] is the second, and this test pins it:
+/// the capture from the first run still authenticates the third.
+#[tokio::test]
+async fn cancelling_a_run_keeps_the_session_and_its_captures() {
+    use testdet_core::outcome::TransportKind;
+    use tokio_util::sync::CancellationToken;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/login"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "data": { "login": { "token": "tok-a" } } })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/slow"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/echo"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "data": { "me": { "id": "u_1" } } })),
+        )
+        .mount(&server)
+        .await;
+
+    let resolved = resolved_for(
+        &server.uri(),
+        json!({}),
+        vec![
+            login_op_capturing("login", "/login"),
+            http_op("slow", "/slow"),
+            session_token_op("echo", "/echo"),
+        ],
+        None,
+    );
+
+    // The token has to be reachable from the test, exactly as the driver's
+    // shared token is reachable from the UI thread.
+    let token = CancellationToken::new();
+    let mut context = RunContext::new(resolved, Arc::new(Redactor::new()));
+    context.cancel = token.clone();
+    let mut store = SessionStore::new(context);
+
+    // A: the login captures a token into the session.
+    let login = login_op_capturing("login", "/login");
+    assert_eq!(execute_for_user(&mut store, None, &login).await.status, 200);
+    assert_eq!(
+        store.vars(None).get("token"),
+        Some(&json!("tok-a")),
+        "the login captured a token"
+    );
+
+    // B: cancelled while in flight.
+    token.cancel();
+    let cancelled = execute_for_user(&mut store, None, &http_op("slow", "/slow")).await;
+    assert!(
+        cancelled
+            .transport_error
+            .as_ref()
+            .is_some_and(|error| error.kind == TransportKind::Cancelled),
+        "the slow run was cancelled: {cancelled:?}"
+    );
+
+    // The re-arm keeps the store: same cookie jar, same captures.
+    let fresh = store.renew_cancellation();
+    assert!(!fresh.is_cancelled(), "the renewed token is usable again");
+    assert_eq!(
+        store.vars(None).get("token"),
+        Some(&json!("tok-a")),
+        "the capture survived the cancellation"
+    );
+
+    // C: still authenticated with A's capture.
+    let echo = execute_for_user(&mut store, None, &session_token_op("echo", "/echo")).await;
+    assert_eq!(echo.status, 200);
+    assert_eq!(
+        last_header(&server, "/echo", "authorization")
+            .await
+            .as_deref(),
+        Some("Bearer tok-a"),
+        "the later request still carries the captured token"
+    );
+    assert_eq!(
+        count_to(&server, "/login").await,
+        1,
+        "no re-login happened: the session itself was never dropped"
+    );
+}

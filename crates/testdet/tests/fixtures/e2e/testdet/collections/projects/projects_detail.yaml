@@ -1,0 +1,9 @@
+id: projects_detail
+description: Read the project captured by `projects`, over REST.
+tags: [projects]
+request:
+  kind: http
+  method: GET
+  path: /projects/{{session.projectId}}
+  headers:
+    Authorization: "Bearer {{session.token}}"

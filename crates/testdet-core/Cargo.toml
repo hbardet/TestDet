@@ -1,0 +1,26 @@
+[package]
+name = "testdet-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+base64 = "0.22"
+bytes = "1"
+jsonschema = "0.63.1"
+percent-encoding = "2"
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "multipart", "rustls-tls"] }
+saphyr = "0.4.0"
+saphyr-parser = "0.4.0"
+schemars = "1.2.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
+serde_path_to_error = "0.1.20"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+base64 = "0.22"
+serde_json = "1.0"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+wiremock = "0.6"

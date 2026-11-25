@@ -1,0 +1,28 @@
+id: login
+description: Log in and capture the session token.
+tags: [auth]
+vars:
+  email: alice@example.test
+request:
+  kind: graphql
+  # The login endpoint is mounted apart from the data graph in the fixture's
+  # mock, so the token exchange is visible as its own request.
+  path: /auth/login
+  operationName: Login
+  query: |
+    mutation Login($email: String!, $password: String!) {
+      login(email: $email, password: $password) {
+        token
+        project {
+          id
+        }
+      }
+    }
+  variables:
+    email: "{{var.email}}"
+    password: "{{env.E2E_PASSWORD}}"
+# `projects` captures the id of the project it actually listed; `projects_detail`
+# spends it. The login response also reports the user's default project, which
+# `tests/e2e.rs` uses to prove the detail path took `projects`' capture.
+capture:
+  token: data.login.token

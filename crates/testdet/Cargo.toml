@@ -1,0 +1,15 @@
+[package]
+name = "testdet"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+testdet-cli = { path = "../testdet-cli" }
+testdet-core = { path = "../testdet-core" }
+testdet-tui = { path = "../testdet-tui" }
+
+[dev-dependencies]
+serde_json = "1.0"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
+wiremock = "0.6"

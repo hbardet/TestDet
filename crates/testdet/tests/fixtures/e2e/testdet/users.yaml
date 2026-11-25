@@ -1,0 +1,13 @@
+defaultLogin: login
+users:
+  # A credentials user: the login operation fills its variables from here when
+  # a run selects it with `--user alice`.
+  alice:
+    credentials:
+      email: alice@example.test
+      password: "{{env.E2E_PASSWORD}}"
+  # A static-token user with its own header: no login request, ever. It is also
+  # the reference that keeps `E2E_UNUSED` visible to `testdet env`.
+  robot:
+    token: "{{env.E2E_UNUSED}}"
+    tokenHeader: X-Robot-Token

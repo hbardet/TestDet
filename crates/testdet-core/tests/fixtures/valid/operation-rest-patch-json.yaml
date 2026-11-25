@@ -1,0 +1,10 @@
+id: renameUser
+tags: [users, mutation]
+request:
+  kind: http
+  method: PATCH
+  path: /v1/users/{{var.userId}}
+  body:
+    kind: json
+    value:
+      displayName: "{{var.newName}}"

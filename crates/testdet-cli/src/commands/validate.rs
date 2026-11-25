@@ -1,0 +1,78 @@
+//! `testdet validate` — check the config and report every diagnostic.
+
+use std::path::PathBuf;
+
+use testdet_core::config::LoadOptions;
+use testdet_core::config::load_with_diagnostics;
+use testdet_core::diagnostic::{render_json, render_text};
+use testdet_core::secrets::secret_warnings;
+
+use crate::exit::Exit;
+use crate::format::Format;
+
+/// Arguments for `testdet validate`.
+#[derive(Debug, Clone)]
+pub struct ValidateArgs {
+    /// Explicit `--config` path; `None` discovers by walking up from `cwd`.
+    pub config: Option<PathBuf>,
+    /// Output format (`--format`).
+    pub format: Format,
+    /// Explicit `--env`; selects the secrets declaration file used to
+    /// classify `{{env.*}}` references (defaults to the manifest's
+    /// `defaultEnvironment`, then the synthetic `local`).
+    pub env: Option<String>,
+}
+
+/// Run `testdet validate`.
+///
+/// Builds every diagnostic with [`load_with_diagnostics`] (warnings included) so a
+/// warnings-only config prints its warnings and exits 0. A config with at
+/// least one error exits 1. The returned string is the complete rendered
+/// output; `testdet-cli::run` routes it to stdout for [`Format::Json`] and to
+/// stderr otherwise (a validation result is diagnostics, not data).
+pub fn run(args: ValidateArgs) -> (Exit, String) {
+    if args.format == Format::Ndjson {
+        return (Exit::Usage, crate::commands::ndjson_usage_error());
+    }
+
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            return (
+                Exit::Internal,
+                format!("internal error: could not read the current directory: {error}\n"),
+            );
+        }
+    };
+
+    let (config, mut diagnostics) = load_with_diagnostics(&LoadOptions {
+        config: args.config,
+        cwd,
+        env: args.env,
+    });
+
+    // Surface unset-secret warnings (ruling 6): a declared-but-unset reference
+    // is a warning; an undeclared reference is already `E_UNKNOWN_ENV` from
+    // crosscheck and is not duplicated here.
+    if let Some(config) = &config {
+        diagnostics.extend(secret_warnings(config).iter().cloned());
+    }
+
+    let exit = if diagnostics.has_errors() {
+        Exit::ConfigInvalid
+    } else {
+        Exit::Ok
+    };
+
+    let output = match args.format {
+        Format::Json => {
+            let mut json = render_json(&diagnostics);
+            json.push('\n');
+            json
+        }
+        Format::Text => render_text(&diagnostics),
+        Format::Ndjson => unreachable!("handled above"),
+    };
+
+    (exit, output)
+}
